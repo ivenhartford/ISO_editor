@@ -25,6 +25,7 @@ class ISOEditor:
         self.selected_node = None
         self.iso_modified = False
         self.next_extent_location = 0
+        self.iso_file_handle = None
 
         # Create GUI
         self.create_menu()
@@ -155,6 +156,12 @@ class ISOEditor:
             self.root.title("ISO Editor [Modified]")
         self.update_status("ISO modified")
 
+    def close_iso(self):
+        """Close the currently open ISO file handle, if it exists."""
+        if self.iso_file_handle:
+            self.iso_file_handle.close()
+            self.iso_file_handle = None
+
     def open_iso(self):
         """Open an ISO file"""
         file_path = filedialog.askopenfilename(
@@ -171,12 +178,12 @@ class ISOEditor:
                 self.update_status("Error loading ISO")
 
     def load_iso(self, file_path):
-        """Load and parse ISO file"""
+        """Load and parse ISO file using streaming."""
+        self.close_iso() # Close any existing file
         self.current_iso_path = file_path
 
-        with open(file_path, 'rb') as f:
-            # Read the entire ISO into memory (for small-medium ISOs)
-            self.iso_data = f.read()
+        self.iso_file_handle = open(file_path, 'rb')
+        self.iso_data = None # Ensure old data is cleared
 
         # Parse ISO 9660 structure
         self.parse_iso_structure()
@@ -184,24 +191,48 @@ class ISOEditor:
         self.populate_file_tree()
 
     def parse_iso_structure(self):
-        """Parse ISO 9660 file system structure"""
-        # Find Primary Volume Descriptor (sector 16, 2048 bytes per sector)
-        pvd_offset = 16 * 2048
+        """Parse ISO 9660 file system structure, looking for PVD and Joliet SVD."""
+        pvd = None
+        joliet_svd = None
+        self.is_joliet = False
 
-        if len(self.iso_data) < pvd_offset + 2048:
-            raise ValueError("Invalid ISO file: too small")
+        lba = 16
+        while True:
+            offset = lba * 2048
+            self.iso_file_handle.seek(offset)
+            vd = self.iso_file_handle.read(2048)
+            if len(vd) < 2048:
+                break
 
-        # Read Primary Volume Descriptor
-        pvd_data = self.iso_data[pvd_offset:pvd_offset + 2048]
+            vd_type = vd[0]
 
-        # Check PVD signature
-        if pvd_data[0:5] != b'\x01CD001':
-            raise ValueError("Invalid ISO file: PVD signature not found")
+            if vd[1:6] != b'CD001':
+                break
 
-        # Extract volume information
+            if vd_type == 1:
+                pvd = vd
+            elif vd_type == 2:
+                escape_seq = vd[88:120]
+                if b'%/@' in escape_seq or b'%/C' in escape_seq or b'%/E' in escape_seq:
+                    joliet_svd = vd
+            elif vd_type == 255:
+                break
+
+            lba += 1
+
+        pvd_data = joliet_svd if joliet_svd is not None else pvd
+        if pvd_data is None:
+            raise ValueError("No valid Primary or Joliet Volume Descriptor found.")
+
+        if joliet_svd is not None:
+            self.is_joliet = True
+            print("Joliet SVD found. Using Joliet names.")
+
+        id_encoding = 'utf-16-be' if self.is_joliet else 'ascii'
+
         self.volume_descriptor = {
-            'system_id': pvd_data[8:40].decode('ascii', errors='ignore').strip(),
-            'volume_id': pvd_data[40:72].decode('ascii', errors='ignore').strip(),
+            'system_id': pvd_data[8:40].decode(id_encoding, errors='ignore').strip('\x00'),
+            'volume_id': pvd_data[40:72].decode(id_encoding, errors='ignore').strip('\x00'),
             'volume_size': struct.unpack('<L', pvd_data[80:84])[0],
             'volume_set_size': struct.unpack('<H', pvd_data[120:122])[0],
             'volume_sequence_number': struct.unpack('<H', pvd_data[124:126])[0],
@@ -210,7 +241,6 @@ class ISOEditor:
             'root_dir_record': pvd_data[156:190]
         }
 
-        # Parse root directory
         self.root_directory = self.parse_directory_record(self.volume_descriptor['root_dir_record'])
 
         # Build complete directory tree
@@ -218,6 +248,52 @@ class ISOEditor:
 
         # Calculate next available extent location for new files
         self.calculate_next_extent_location()
+
+    def _parse_susp_entries(self, system_use_data):
+        """Parse SUSP and Rock Ridge entries from the System Use Area."""
+        entries = {}
+        i = 0
+        while i < len(system_use_data) - 4:
+            try:
+                signature = system_use_data[i:i+2]
+                length = system_use_data[i+2]
+                version = system_use_data[i+3]
+
+                if length == 0: break
+
+                data = system_use_data[i+4:i+length]
+
+                if signature == b'NM':
+                    entries['name'] = data.decode('ascii', 'ignore')
+                elif signature == b'PX':
+                    entries['posix'] = data
+                elif signature == b'SL':
+                    link_parts = []
+                    j = 0
+                    while j < len(data):
+                        flags = data[j]
+                        j += 1
+                        component_len = data[j]
+                        j += 1
+                        component = data[j:j+component_len].decode('ascii', 'ignore')
+                        if component == '.': pass # Current dir, do nothing
+                        elif component == '..':
+                            if link_parts: link_parts.pop()
+                        elif component:
+                            link_parts.append(component)
+                        j += component_len
+                    entries['symlink'] = '/'.join(link_parts)
+                elif signature == b'TF':
+                    entries['timestamps'] = data
+                elif signature == b'SP':
+                    if data == b'\xbe\xef': entries['susp_present'] = True
+
+                i += length
+            except Exception:
+                # Malformed entry, stop parsing this area
+                break
+
+        return entries
 
     def parse_directory_record(self, record_data):
         """Parse a directory record"""
@@ -242,7 +318,31 @@ class ISOEditor:
 
         # File identifier length and name
         file_id_length = record_data[32]
-        file_id = record_data[33:33 + file_id_length].decode('ascii', errors='ignore')
+        file_id_bytes = record_data[33:33 + file_id_length]
+
+        # System Use Area starts after the file identifier and optional padding
+        system_use_offset = 33 + file_id_length
+        if file_id_length % 2 == 0:
+            system_use_offset += 1
+        system_use_data = record_data[system_use_offset:]
+
+        # Parse Rock Ridge extensions
+        rr_entries = self._parse_susp_entries(system_use_data)
+
+        # Decode filename based on volume type (Joliet or standard)
+        if self.is_joliet:
+            if file_id_bytes == b'\x00':
+                file_id = '.'
+            elif file_id_bytes == b'\x01':
+                file_id = '..'
+            else:
+                file_id = file_id_bytes.decode('utf-16-be', 'ignore')
+        else:
+            file_id = file_id_bytes.decode('ascii', 'ignore')
+
+        # Rock Ridge 'NM' entry overrides the standard filename
+        if 'name' in rr_entries:
+            file_id = rr_entries['name']
 
         # Parse recording date
         date_str = "Unknown"
@@ -331,18 +431,19 @@ class ISOEditor:
             print(f"Error building subtree for {parent_node['name']}: {e}")
 
     def read_directory_entries(self, extent_location):
-        """Read all entries from a directory"""
+        """Read all entries from a directory using file streaming."""
         entries = []
-        block_size = self.volume_descriptor['logical_block_size']
-
-        # Read directory data
-        offset = extent_location * block_size
-
-        if offset >= len(self.iso_data):
+        if not self.iso_file_handle:
             return entries
 
-        # Read the directory block
-        directory_data = self.iso_data[offset:offset + block_size]
+        block_size = self.volume_descriptor['logical_block_size']
+        offset = extent_location * block_size
+
+        try:
+            self.iso_file_handle.seek(offset)
+            directory_data = self.iso_file_handle.read(block_size)
+        except (IOError, ValueError):
+            return entries # Failed to seek/read
 
         # Parse directory records
         pos = 0
@@ -481,13 +582,8 @@ class ISOEditor:
             self.update_status("Building ISO, please wait...")
             self.root.update_idletasks()
 
-            builder = ISOBuilder(self.directory_tree, self.volume_descriptor.get('volume_id', 'TK_ISO_VOL'))
-            iso_data = builder.build()
-
-            self.update_status(f"Writing to {os.path.basename(file_path)}...")
-            self.root.update_idletasks()
-            with open(file_path, 'wb') as f:
-                f.write(iso_data)
+            builder = ISOBuilder(self.directory_tree, file_path, self.volume_descriptor.get('volume_id', 'TK_ISO_VOL'), use_joliet=True, use_rock_ridge=True)
+            builder.build()
 
             self.current_iso_path = file_path
             self.iso_modified = False
@@ -1030,15 +1126,20 @@ class ISOEditor:
         if node.get('is_new', False) and 'file_data' in node:
             return node['file_data']
 
-        # Otherwise, read from original ISO
+        # Otherwise, read from original ISO using the file handle
+        if not self.iso_file_handle:
+            return b''
+
         block_size = self.volume_descriptor['logical_block_size']
         offset = node['extent_location'] * block_size
         size = node['size']
 
-        if offset + size > len(self.iso_data):
-            size = len(self.iso_data) - offset
-
-        return self.iso_data[offset:offset + size]
+        try:
+            self.iso_file_handle.seek(offset)
+            return self.iso_file_handle.read(size)
+        except (IOError, ValueError):
+            messagebox.showerror("Read Error", f"Failed to read data for file '{node['name']}'.")
+            return b''
 
 # ==============================================================================
 # ISO 9660 Building Logic
@@ -1075,255 +1176,450 @@ def _format_str_a(s, length):
     return s.ljust(length, ' ').encode('ascii')
 
 class ISOBuilder:
-    def __init__(self, root_node, volume_id="TK_ISO_VOL"):
+    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL", use_joliet=True, use_rock_ridge=True):
         self.root_node = root_node
+        self.output_path = output_path
         self.volume_id = volume_id
+        self.use_joliet = use_joliet
+        self.use_rock_ridge = use_rock_ridge
         self.logical_block_size = 2048
-
-        self.path_table_records = []
-        self.l_path_table_data = b''
-        self.m_path_table_data = b''
-
-        self.l_path_table_lba = 0
-        self.m_path_table_lba = 0
-
         self.next_lba = 0
-        self.file_and_dir_data = {}  # LBA -> data bytes
+        self.temp_file = None
 
     def build(self):
-        """Main method to build the ISO byte stream."""
-        # --- Pass 1: Layout and Path Table Generation ---
-        # System Area (16 * 2048 = 32768 bytes) is reserved.
-        self.next_lba = 16
+        """Main method to build the ISO by writing to a temporary file."""
+        self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+        try:
+            # Reserve space for system area by seeking past it
+            self.temp_file.seek(16 * self.logical_block_size)
+            self.next_lba = 16
 
-        # Reserve space for Volume Descriptors
-        pvd_lba = self.next_lba
-        self.next_lba += 1 # PVD
-        self.next_lba += 1 # Terminator
+            pvd_lba = self.next_lba; self.next_lba += 1
+            svd_lba = self.next_lba if self.use_joliet else 0; self.next_lba += (1 if self.use_joliet else 0)
+            terminator_lba = self.next_lba; self.next_lba += 1
 
-        # Recursively lay out directories and files, and collect path table info
-        self._layout_pass(self.root_node, 1)
+            # Layout pass for PVD to place files and get their LBAs
+            pvd_path_records, file_map = self._layout_hierarchy(is_joliet=False)
 
-        # Now that layout is done, generate path tables.
-        self._generate_path_tables()
+            # Write PVD hierarchy
+            pvd_l_path, pvd_m_path = self._generate_path_tables(pvd_path_records, False)
+            pvd_l_path_lba = self._write_data_block(pvd_l_path)
+            pvd_m_path_lba = self._write_data_block(pvd_m_path)
+            self._write_directory_records_recursively(self.root_node, False)
 
-        self.l_path_table_lba = self.next_lba
-        self.next_lba += math.ceil(len(self.l_path_table_data) / self.logical_block_size)
-        self.m_path_table_lba = self.next_lba
-        self.next_lba += math.ceil(len(self.m_path_table_data) / self.logical_block_size)
+            # Write SVD (Joliet) hierarchy
+            if self.use_joliet:
+                svd_path_records, _ = self._layout_hierarchy(is_joliet=True, file_map=file_map)
+                svd_l_path, svd_m_path = self._generate_path_tables(svd_path_records, True)
+                svd_l_path_lba = self._write_data_block(svd_l_path)
+                svd_m_path_lba = self._write_data_block(svd_m_path)
+                self._write_directory_records_recursively(self.root_node, True)
 
-        # --- Pass 2: Directory Record Generation ---
-        # Now that all LBAs are known, generate the actual directory record data
-        self._generate_all_directory_records(self.root_node)
+            volume_size_in_blocks = self.next_lba
 
-        # --- Pass 3: Final Assembly ---
-        volume_size_in_blocks = self.next_lba
+            # Write volume descriptors now that we have all locations
+            pvd_data = self._generate_pvd(volume_size_in_blocks, pvd_l_path_lba, pvd_m_path_lba, len(pvd_l_path), False)
+            self._write_data_at_lba(pvd_lba, pvd_data)
 
-        # Generate PVD with all final locations and sizes
-        pvd_data = self._generate_pvd(volume_size_in_blocks)
-        self.file_and_dir_data[pvd_lba] = pvd_data
+            if self.use_joliet:
+                svd_data = self._generate_pvd(volume_size_in_blocks, svd_l_path_lba, svd_m_path_lba, len(svd_l_path), True)
+                self._write_data_at_lba(svd_lba, svd_data)
 
-        # Generate terminator
-        terminator_data = self._generate_terminator()
-        self.file_and_dir_data[pvd_lba + 1] = terminator_data
+            terminator_data = self._generate_terminator()
+            self._write_data_at_lba(terminator_lba, terminator_data)
 
-        # Place path tables
-        self.file_and_dir_data[self.l_path_table_lba] = self.l_path_table_data
-        self.file_and_dir_data[self.m_path_table_lba] = self.m_path_table_data
+        finally:
+            if self.temp_file:
+                self.temp_file.close()
+                shutil.move(self.temp_file.name, self.output_path)
 
-        # Assemble the final ISO bytearray
-        iso_data = bytearray(volume_size_in_blocks * self.logical_block_size)
-        for lba, data in self.file_and_dir_data.items():
-            start_offset = lba * self.logical_block_size
-            iso_data[start_offset : start_offset + len(data)] = data
+    def _write_data_at_lba(self, lba, data):
+        self.temp_file.seek(lba * self.logical_block_size)
+        self.temp_file.write(data)
 
-        return iso_data
+    def _write_data_block(self, data):
+        """Writes data to the next available LBA and returns the LBA."""
+        lba = self.next_lba
+        self._write_data_at_lba(lba, data)
+        self.next_lba += math.ceil(len(data) / self.logical_block_size) if data else 1
+        return lba
 
-    def _layout_pass(self, node, parent_dir_num):
-        """Recursively traverses the tree to assign LBAs and gather path table info."""
-        dir_num = len(self.path_table_records) + 1
-        node['dir_num'] = dir_num
+    def _get_short_name(self, name):
+        """Generates an ISO 9660 compliant 8.3 filename."""
+        name = name.upper()
+        allowed_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+        name = ''.join(c for c in name if c in allowed_chars)
+        parts = name.split('.')
+        if len(parts) > 1 and parts[-1]:
+            base = ''.join(parts[:-1])
+            ext = parts[-1]
+            return base[:8] + '.' + ext[:3]
+        else:
+            return name[:11].split('.')[0][:8]
 
-        self.path_table_records.append({
-            'node': node,
-            'parent_dir_num': parent_dir_num
-        })
+    def _layout_hierarchy(self, is_joliet, file_map=None):
+        path_table_records = []
+        if file_map is None: file_map = {}
 
-        # First, recurse into subdirectories to handle them first
-        for child in sorted(node['children'], key=lambda x: x['name']):
-            if child['is_directory']:
-                self._layout_pass(child, dir_num)
+        def _recursive_layout(node, parent_dir_num):
+            dir_num = len(path_table_records) + 1
+            path_table_records.append({'node': node, 'parent_dir_num': parent_dir_num})
 
-        # Then, lay out files in the current directory
-        for child in sorted(node['children'], key=lambda x: x['name']):
-            if not child['is_directory']:
-                file_data = child.get('file_data', b'')
-                num_blocks = math.ceil(child['size'] / self.logical_block_size)
-                if num_blocks == 0: num_blocks = 1 # min 1 block even for 0-byte file
+            for child in sorted(node['children'], key=lambda x: x['name']):
+                if child['is_directory']:
+                    _recursive_layout(child, dir_num)
 
-                child['extent_location'] = self.next_lba
-                self.file_and_dir_data[self.next_lba] = file_data
-                self.next_lba += num_blocks
+            if not is_joliet:
+                for child in sorted(node['children'], key=lambda x: x['name']):
+                    if not child['is_directory']:
+                        child_id = id(child)
+                        if child_id not in file_map:
+                            file_data = child.get('file_data', b'')
+                            child['extent_location'] = self._write_data_block(file_data)
+                            file_map[child_id] = child['extent_location']
+                        else:
+                            child['extent_location'] = file_map[child_id]
+            else:
+                 for child in sorted(node['children'], key=lambda x: x['name']):
+                    if not child['is_directory']:
+                        child['extent_location'] = file_map[id(child)]
 
-        # Finally, calculate this directory's record size and assign its LBA
-        dir_records_data = self._generate_directory_records_for_node(node)
-        node['data_length'] = len(dir_records_data)
+            dir_records_data = self._generate_directory_records_for_node(node, is_joliet)
+            data_len_key = 'joliet_data_length' if is_joliet else 'pvd_data_length'
+            extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+            node[data_len_key] = len(dir_records_data)
+            node[extent_loc_key] = self._write_data_block(b'\x00' * node[data_len_key]) # Reserve space
 
-        num_blocks = math.ceil(node['data_length'] / self.logical_block_size)
-        if num_blocks == 0: num_blocks = 1
+        _recursive_layout(self.root_node, 1)
+        return path_table_records, file_map
 
-        node['extent_location'] = self.next_lba
-        self.next_lba += num_blocks
+    def _generate_path_tables(self, path_table_records, is_joliet):
+        path_table_records.sort(key=lambda r: self.get_node_path(r['node']))
+        dir_num_map = {self.get_node_path(r['node']): i + 1 for i, r in enumerate(path_table_records)}
 
-    def _generate_path_tables(self):
-        """Generates both L-type and M-type path tables."""
-        # Sort records for path table: root, then level 1 alphabetically, etc.
-        self.path_table_records.sort(key=lambda r: self.get_node_path(r['node']))
-
-        # Re-number directories after sorting and create a lookup
-        dir_num_map = {self.get_node_path(r['node']): i + 1 for i, r in enumerate(self.path_table_records)}
-
-        l_table = bytearray()
-        m_table = bytearray()
-
-        for record in self.path_table_records:
+        l_table, m_table = bytearray(), bytearray()
+        for record in path_table_records:
             node = record['node']
             path = self.get_node_path(node)
             parent_path = os.path.dirname(path).replace('\\', '/') if path != '/' else '/'
             parent_dir_num = dir_num_map.get(parent_path, 1)
+            extent_loc = node['joliet_extent_location' if is_joliet else 'pvd_extent_location']
+            name = self._get_short_name(node['name']) if not is_joliet else node['name']
 
-            dir_id = b'\x00' if node['name'] == '/' else node['name'].encode('ascii')
+            dir_id = b'\x00' if name == '/' else name.encode('utf-16-be' if is_joliet else 'ascii')
             id_len = len(dir_id)
 
-            # L-Path Table Record (Little Endian)
-            l_rec = struct.pack('<BB<L<H', id_len, 0, node['extent_location'], parent_dir_num) + dir_id
-            if id_len % 2 != 0:
-                l_rec += b'\x00'
+            l_rec = struct.pack('<BB<L<H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            if id_len % 2 != 0: l_rec += b'\x00'
             l_table.extend(l_rec)
-
-            # M-Path Table Record (Big Endian)
-            m_rec = struct.pack('<BB>L>H', id_len, 0, node['extent_location'], parent_dir_num) + dir_id
-            if id_len % 2 != 0:
-                m_rec += b'\x00'
+            m_rec = struct.pack('<BB>L>H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            if id_len % 2 != 0: m_rec += b'\x00'
             m_table.extend(m_rec)
+        return bytes(l_table), bytes(m_table)
 
-        self.l_path_table_data = bytes(l_table)
-        self.m_path_table_data = bytes(m_table)
-
-    def _generate_all_directory_records(self, node):
-        """Traverses tree and stores final directory record data."""
-        records_data = self._generate_directory_records_for_node(node)
-
-        # Pad to full block size
-        padded_data = bytearray(math.ceil(len(records_data) / self.logical_block_size) * self.logical_block_size)
-        padded_data[:len(records_data)] = records_data
-
-        self.file_and_dir_data[node['extent_location']] = bytes(padded_data)
-
+    def _write_directory_records_recursively(self, node, is_joliet):
+        records_data = self._generate_directory_records_for_node(node, is_joliet)
+        extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+        self._write_data_at_lba(node[extent_loc_key], records_data)
         for child in node['children']:
             if child['is_directory']:
-                self._generate_all_directory_records(child)
+                self._write_directory_records_recursively(child, is_joliet)
 
-    def _generate_directory_records_for_node(self, node):
-        """Generates the concatenated record data for all children of a node."""
+    def _generate_directory_records_for_node(self, node, is_joliet):
         all_records = bytearray()
-
-        # '.' entry (self)
-        all_records.extend(self._create_dir_record(node, is_self=True))
-
-        # '..' entry (parent)
-        all_records.extend(self._create_dir_record(node.get('parent', node), is_parent=True))
-
-        # Child entries
+        all_records.extend(self._create_dir_record(node, is_joliet, is_self=True))
+        all_records.extend(self._create_dir_record(node.get('parent', node), is_joliet, is_parent=True))
         for child in sorted(node['children'], key=lambda x: x['name']):
-            all_records.extend(self._create_dir_record(child))
-
+            all_records.extend(self._create_dir_record(child, is_joliet))
         return bytes(all_records)
 
-    def _create_dir_record(self, node, is_self=False, is_parent=False):
-        """Creates a single directory record."""
-        file_flags = 0
-        if node['is_directory']:
-            file_flags |= 0x02
-        if node.get('is_hidden', False):
-            file_flags |= 0x01
+    def _create_dir_record(self, node, is_joliet, is_self=False, is_parent=False):
+        file_flags = 0x02 if node.get('is_directory') else 0
+        if node.get('is_hidden', False): file_flags |= 0x01
 
-        if is_self:
-            file_id = b'\x00'
-            data_len = node['data_length']
-        elif is_parent:
-            file_id = b'\x01'
-            data_len = node['data_length']
+        extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+        data_len_key = 'joliet_data_length' if is_joliet else 'pvd_data_length'
+
+        extent_loc = node.get(extent_loc_key, node.get('extent_location', 0))
+        data_len = node.get(data_len_key, 0) if node.get('is_directory') else node.get('size', 0)
+
+        system_use_data = b''
+
+        if is_self: file_id_bytes = b'\x00'
+        elif is_parent: file_id_bytes = b'\x01'
         else:
-            file_id_str = node['name']
-            if not node['is_directory']:
-                file_id_str += ';1'
-            file_id = file_id_str.encode('ascii')
-            data_len = node['size'] if not node['is_directory'] else node['data_length']
+            if is_joliet:
+                file_id_bytes = node['name'].encode('utf-16-be')
+            else:
+                short_name = self._get_short_name(node['name'])
+                if not node['is_directory']: short_name += ';1'
+                file_id_bytes = short_name.encode('ascii')
+                if self.use_rock_ridge and node['name'].upper() != short_name.split(';')[0]:
+                    nm_data = node['name'].encode('ascii', 'ignore')
+                    system_use_data += b'NM' + struct.pack('<BB', len(nm_data) + 5, 1) + nm_data
 
-        file_id_len = len(file_id)
-
-        try:
-            record_date = datetime.strptime(node['date'], "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            record_date = datetime.now()
-        dir_date_bytes = _format_dir_date(record_date)
-
-        record_len = 33 + file_id_len
-        if record_len % 2 != 0:
-            record_len += 1 # Records must have even length
+        file_id_len = len(file_id_bytes)
+        record_len = 33 + file_id_len + len(system_use_data)
+        if record_len % 2 != 0: record_len += 1
 
         rec = bytearray(record_len)
         struct.pack_into('<B', rec, 0, record_len)
-        struct.pack_into('<B', rec, 1, 0)  # Extended Attribute Record Length
-        rec[2:10] = _pack_both_endian_32(node['extent_location'])
+        rec[2:10] = _pack_both_endian_32(extent_loc)
         rec[10:18] = _pack_both_endian_32(data_len)
-        rec[18:25] = dir_date_bytes
+        rec[18:25] = _format_dir_date(datetime.strptime(node['date'], "%Y-%m-%d %H:%M:%S") if node.get('date') else datetime.now())
         struct.pack_into('<B', rec, 25, file_flags)
-        # Bytes 26, 27 are 0 for non-interleaved files
-        rec[28:32] = _pack_both_endian_16(1)  # Volume Sequence Number
+        rec[28:32] = _pack_both_endian_16(1)
         struct.pack_into('<B', rec, 32, file_id_len)
-        rec[33:33 + file_id_len] = file_id
+        rec[33:33 + file_id_len] = file_id_bytes
+        if system_use_data:
+            offset = 33 + file_id_len
+            if file_id_len % 2 == 0: offset += 1
+            rec[offset:offset+len(system_use_data)] = system_use_data
+        return bytes(rec)
+
+    def _generate_pvd(self, volume_size, lba_l, lba_m, path_table_size, is_joliet=False):
+        vd = bytearray(self.logical_block_size)
+        vd_type = 2 if is_joliet else 1
+        encoding = 'utf-16-be' if is_joliet else 'ascii'
+        root_record_data = self._create_dir_record(self.root_node, is_joliet, is_self=True)
+        vd[0:1] = struct.pack('B', vd_type)
+        vd[1:6] = b'CD001'; vd[6:7] = b'\x01'
+        if is_joliet: vd[88:91] = b'%/@'
+        vd[8:40] = _format_str_a("PYTHON TK ISO EDITOR", 32)
+        vd[40:72] = self.volume_id.encode(encoding, 'ignore').ljust(32, b'\x00' if is_joliet else b' ')
+        vd[80:88] = _pack_both_endian_32(volume_size)
+        vd[120:124] = _pack_both_endian_16(1)
+        vd[124:128] = _pack_both_endian_16(1)
+        vd[128:132] = _pack_both_endian_16(self.logical_block_size)
+        vd[132:140] = _pack_both_endian_32(path_table_size)
+        vd[140:144] = struct.pack('<L', lba_l)
+        vd[148:152] = struct.pack('>L', lba_m)
+        vd[156:190] = root_record_data[:34]
+        vd[190:318] = "ISO_SET".encode(encoding, 'ignore').ljust(128, b'\x00' if is_joliet else b' ')
+        vd[881:882] = b'\x01'
+        return vd
+
+    def _generate_terminator(self):
+        terminator = bytearray(self.logical_block_size)
+        terminator[0:1] = b'\xff'; terminator[1:6] = b'CD001'; terminator[6:7] = b'\x01'
+        return terminator
+
+    def get_node_path(self, node):
+        if not node.get('parent'): return '/'
+        path_parts = []
+        current = node
+        while current and current.get('parent'):
+            path_parts.append(current['name'])
+            current = current['parent']
+        return '/' + '/'.join(reversed(path_parts))
+
+    def _get_short_name(self, name):
+        """Generates an ISO 9660 compliant 8.3 filename."""
+        name = name.upper()
+        allowed_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+        name = ''.join(c for c in name if c in allowed_chars)
+
+        parts = name.split('.')
+        if len(parts) > 1:
+            base = parts[0]
+            ext = parts[-1]
+            return base[:8] + '.' + ext[:3]
+        else:
+            return name[:8]
+
+    def _layout_hierarchy(self, is_joliet, file_map=None):
+        """Lays out one directory hierarchy (either PVD or SVD)."""
+        path_table_records = []
+        if file_map is None:
+            file_map = {} # Cache file locations to avoid duplicating data
+
+        def _recursive_layout(node, parent_dir_num):
+            dir_num = len(path_table_records) + 1
+            node_id = id(node)
+
+            if is_joliet:
+                node['joliet_dir_num'] = dir_num
+            else:
+                node['pvd_dir_num'] = dir_num
+
+            path_table_records.append({'node': node, 'parent_dir_num': parent_dir_num})
+
+            # Recurse into subdirectories first
+            for child in sorted(node['children'], key=lambda x: x['name']):
+                if child['is_directory']:
+                    _recursive_layout(child, dir_num)
+
+            # Lay out files, only if this is the primary pass
+            if not is_joliet:
+                for child in sorted(node['children'], key=lambda x: x['name']):
+                    if not child['is_directory']:
+                        file_data = child.get('file_data', b'')
+                        num_blocks = math.ceil(child['size'] / self.logical_block_size)
+
+                        child_id = id(child)
+                        if child_id not in file_map:
+                            child['extent_location'] = self.next_lba
+                            file_map[child_id] = self.next_lba
+                            self.file_and_dir_data[self.next_lba] = file_data
+                            self.next_lba += num_blocks
+                        else:
+                            child['extent_location'] = file_map[child_id]
+            else: # For Joliet, just copy extent locations
+                 for child in sorted(node['children'], key=lambda x: x['name']):
+                    if not child['is_directory']:
+                        child['extent_location'] = file_map[id(child)]
+
+
+            # Calculate this directory's record size and assign its LBA
+            dir_records_data = self._generate_directory_records_for_node(node, is_joliet)
+            data_len_key = 'joliet_data_length' if is_joliet else 'pvd_data_length'
+            extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+
+            node[data_len_key] = len(dir_records_data)
+            num_blocks = math.ceil(node[data_len_key] / self.logical_block_size)
+            if num_blocks == 0: num_blocks = 1
+
+            node[extent_loc_key] = self.next_lba
+            self.next_lba += num_blocks
+
+        _recursive_layout(self.root_node, 1)
+        return path_table_records, file_map
+
+    def _generate_path_tables(self, path_table_records, is_joliet):
+        # Sort records for path table
+        path_table_records.sort(key=lambda r: self.get_node_path(r['node']))
+
+        dir_num_map = {}
+        for i, record in enumerate(path_table_records):
+            path = self.get_node_path(record['node'])
+            dir_num_map[path] = i + 1
+
+        l_table, m_table = bytearray(), bytearray()
+        for record in path_table_records:
+            node = record['node']
+            path = self.get_node_path(node)
+            parent_path = os.path.dirname(path).replace('\\', '/') if path != '/' else '/'
+            parent_dir_num = dir_num_map.get(parent_path, 1)
+            extent_loc = node['joliet_extent_location'] if is_joliet else node['pvd_extent_location']
+
+            if node['name'] == '/':
+                dir_id = b'\x00'
+            else:
+                dir_id = node['name'].encode('utf-16-be' if is_joliet else 'ascii')
+
+            id_len = len(dir_id)
+
+            l_rec = struct.pack('<BB<L<H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            if id_len % 2 != 0: l_rec += b'\x00'
+            l_table.extend(l_rec)
+
+            m_rec = struct.pack('<BB>L>H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            if id_len % 2 != 0: m_rec += b'\x00'
+            m_table.extend(m_rec)
+
+        return bytes(l_table), bytes(m_table)
+
+    def _generate_all_directory_records(self, node, is_joliet):
+        records_data = self._generate_directory_records_for_node(node, is_joliet)
+        extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+
+        padded_data = bytearray(math.ceil(len(records_data) / self.logical_block_size) * self.logical_block_size)
+        padded_data[:len(records_data)] = records_data
+
+        self.file_and_dir_data[node[extent_loc_key]] = bytes(padded_data)
+
+        for child in node['children']:
+            if child['is_directory']:
+                self._generate_all_directory_records(child, is_joliet)
+
+    def _generate_directory_records_for_node(self, node, is_joliet):
+        all_records = bytearray()
+        all_records.extend(self._create_dir_record(node, is_joliet, is_self=True))
+        all_records.extend(self._create_dir_record(node.get('parent', node), is_joliet, is_parent=True))
+        for child in sorted(node['children'], key=lambda x: x['name']):
+            all_records.extend(self._create_dir_record(child, is_joliet))
+        return bytes(all_records)
+
+    def _create_dir_record(self, node, is_joliet, is_self=False, is_parent=False):
+        file_flags = 0x02 if node['is_directory'] else 0
+        if node.get('is_hidden', False): file_flags |= 0x01
+
+        extent_loc_key = 'joliet_extent_location' if is_joliet else 'pvd_extent_location'
+        data_len_key = 'joliet_data_length' if is_joliet else 'pvd_data_length'
+
+        extent_loc = node.get(extent_loc_key, node.get('extent_location', 0))
+        data_len = node[data_len_key] if node['is_directory'] else node['size']
+
+        system_use_data = b''
+
+        if is_self:
+            file_id_bytes = b'\x00'
+        elif is_parent:
+            file_id_bytes = b'\x01'
+        else:
+            if is_joliet:
+                file_id_bytes = node['name'].encode('utf-16-be')
+            else:
+                short_name = self._get_short_name(node['name'])
+                if not node['is_directory']: short_name += ';1'
+                file_id_bytes = short_name.encode('ascii')
+
+                if self.use_rock_ridge and node['name'].upper() != short_name.split(';')[0]:
+                    # Add Rock Ridge NM entry for long name
+                    nm_data = node['name'].encode('ascii', 'ignore')
+                    # NM entry: 'N' 'M' len ver name
+                    system_use_data += b'NM' + struct.pack('<BB', len(nm_data) + 4, 1) + nm_data
+
+        file_id_len = len(file_id_bytes)
+        record_len = 33 + file_id_len + len(system_use_data)
+        if record_len % 2 != 0: record_len += 1
+
+        rec = bytearray(record_len)
+        struct.pack_into('<B', rec, 0, record_len)
+        struct.pack_into('<B', rec, 1, 0)
+        rec[2:10] = _pack_both_endian_32(extent_loc)
+        rec[10:18] = _pack_both_endian_32(data_len)
+        rec[18:25] = _format_dir_date(datetime.strptime(node['date'], "%Y-%m-%d %H:%M:%S") if node.get('date') else datetime.now())
+        struct.pack_into('<B', rec, 25, file_flags)
+        rec[28:32] = _pack_both_endian_16(1)
+        struct.pack_into('<B', rec, 32, file_id_len)
+        rec[33:33 + file_id_len] = file_id_bytes
+        if system_use_data:
+            offset = 33 + file_id_len
+            if file_id_len % 2 == 0: offset += 1
+            rec[offset:offset+len(system_use_data)] = system_use_data
 
         return bytes(rec)
 
-    def _generate_pvd(self, volume_size_in_blocks):
-        """Generates the Primary Volume Descriptor."""
-        pvd = bytearray(self.logical_block_size)
+    def _generate_pvd(self, volume_size, lba_l, lba_m, path_table_size, is_joliet=False):
+        vd = bytearray(self.logical_block_size)
+        vd_type = 2 if is_joliet else 1
+        encoding = 'utf-16-be' if is_joliet else 'ascii'
 
-        root_record_data = self._create_dir_record(self.root_node, is_self=True)
+        root_record_data = self._create_dir_record(self.root_node, is_joliet, is_self=True)
 
-        pvd[0:1] = b'\x01'
-        pvd[1:6] = b'CD001'
-        pvd[6:7] = b'\x01'
-        pvd[8:40] = _format_str_a("PYTHON TK ISO EDITOR", 32)
-        pvd[40:72] = _format_str_d(self.volume_id, 32)
-        pvd[80:88] = _pack_both_endian_32(volume_size_in_blocks)
-        pvd[120:124] = _pack_both_endian_16(1)  # Volume Set Size
-        pvd[124:128] = _pack_both_endian_16(1)  # Volume Sequence Number
-        pvd[128:132] = _pack_both_endian_16(self.logical_block_size)
-        pvd[132:140] = _pack_both_endian_32(len(self.l_path_table_data))
-        pvd[140:144] = struct.pack('<L', self.l_path_table_lba)
-        pvd[148:152] = struct.pack('>L', self.m_path_table_lba)
-        pvd[156:190] = root_record_data[:34] # Root directory record (fixed size)
-        pvd[190:318] = _format_str_d("ISO_SET", 128)
-        pvd[318:446] = _format_str_a("JULES AI", 128)
-        pvd[446:574] = _format_str_a("JULES AI", 128)
-        pvd[574:702] = _format_str_a("ISO EDITOR", 128)
+        vd[0:1] = struct.pack('B', vd_type)
+        vd[1:6] = b'CD001'
+        vd[6:7] = b'\x01'
 
-        now_date = _format_pvd_date()
-        pvd[813:830] = now_date  # Volume Creation
-        pvd[830:847] = now_date  # Volume Modification
-        # Expiration and Effective dates are all '0's
-        zero_date = b'0000000000000000\x00'
-        pvd[847:864] = zero_date
-        pvd[864:881] = zero_date
+        if is_joliet:
+            vd[88:91] = b'%/@' # Joliet escape sequence
 
-        pvd[881:882] = b'\x01'  # File Structure Version
-        return pvd
+        vd[8:40] = _format_str_a("PYTHON TK ISO EDITOR", 32)
+        vd[40:72] = self.volume_id.encode(encoding, 'ignore').ljust(32, b'\x00' if is_joliet else b' ')
+        vd[80:88] = _pack_both_endian_32(volume_size)
+        vd[120:124] = _pack_both_endian_16(1)
+        vd[124:128] = _pack_both_endian_16(1)
+        vd[128:132] = _pack_both_endian_16(self.logical_block_size)
+        vd[132:140] = _pack_both_endian_32(path_table_size)
+        vd[140:144] = struct.pack('<L', lba_l)
+        vd[148:152] = struct.pack('>L', lba_m)
+        vd[156:190] = root_record_data[:34]
+        vd[190:318] = "ISO_SET".encode(encoding, 'ignore').ljust(128, b'\x00' if is_joliet else b' ')
+        vd[881:882] = b'\x01'
+        return vd
 
     def _generate_terminator(self):
-        """Generates the Volume Descriptor Set Terminator."""
         terminator = bytearray(self.logical_block_size)
         terminator[0:1] = b'\xff'
         terminator[1:6] = b'CD001'
@@ -1331,9 +1627,7 @@ class ISOBuilder:
         return terminator
 
     def get_node_path(self, node):
-        """Helper to get full, sortable path for a node."""
-        if not node.get('parent'):
-            return '/'
+        if not node.get('parent'): return '/'
         path_parts = []
         current = node
         while current and current.get('parent'):
