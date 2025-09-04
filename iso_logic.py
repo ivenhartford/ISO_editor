@@ -15,11 +15,17 @@ class ISOCore:
         self.next_extent_location = 0
         self.iso_file_handle = None
         self.is_joliet = False
+        self.boot_image_path = None
+        self.efi_boot_image_path = None
+        self.boot_emulation_type = 'no_emulation'
         self.init_new_iso()
 
     def init_new_iso(self):
         self.close_iso()
         self.current_iso_path = None
+        self.boot_image_path = None
+        self.efi_boot_image_path = None
+        self.boot_emulation_type = 'no_emulation'
         self.iso_modified = False
         self.volume_descriptor = {
             'system_id': 'TK_ISO_EDITOR', 'volume_id': 'NEW_ISO',
@@ -48,9 +54,16 @@ class ISOCore:
         self.iso_modified = False
 
     def save_iso(self, output_path, use_joliet, use_rock_ridge):
-        builder = ISOBuilder(self.directory_tree, output_path,
-                             self.volume_descriptor.get('volume_id', 'TK_ISO_VOL'),
-                             use_joliet, use_rock_ridge)
+        builder = ISOBuilder(
+            root_node=self.directory_tree,
+            output_path=output_path,
+            volume_id=self.volume_descriptor.get('volume_id', 'TK_ISO_VOL'),
+            use_joliet=use_joliet,
+            use_rock_ridge=use_rock_ridge,
+            boot_image_path=self.boot_image_path,
+            efi_boot_image_path=self.efi_boot_image_path,
+            boot_emulation_type=self.boot_emulation_type
+        )
         builder.build()
         self.current_iso_path = output_path
         self.iso_modified = False
@@ -255,12 +268,18 @@ def _format_str_a(s, length):
     return s.ljust(length, ' ').encode('ascii')
 
 class ISOBuilder:
-    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL", use_joliet=True, use_rock_ridge=True):
+    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
+                 use_joliet=True, use_rock_ridge=True,
+                 boot_image_path=None, efi_boot_image_path=None,
+                 boot_emulation_type='no_emulation'):
         self.root_node = root_node
         self.output_path = output_path
         self.volume_id = volume_id
         self.use_joliet = use_joliet
         self.use_rock_ridge = use_rock_ridge
+        self.boot_image_path = boot_image_path
+        self.efi_boot_image_path = efi_boot_image_path
+        self.boot_emulation_type = boot_emulation_type
         self.logical_block_size = 2048
         self.next_lba = 0
         self.temp_file = None
@@ -268,34 +287,102 @@ class ISOBuilder:
     def build(self):
         self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
         try:
+            # Reserve space for system area
             self.temp_file.seek(16 * self.logical_block_size)
             self.next_lba = 16
+
+            # Volume Descriptor LBA locations
             pvd_lba = self.next_lba; self.next_lba += 1
+            bvd_lba = 0
+            if self.boot_image_path or self.efi_boot_image_path:
+                bvd_lba = self.next_lba; self.next_lba += 1
             svd_lba = self.next_lba if self.use_joliet else 0; self.next_lba += (1 if self.use_joliet else 0)
             terminator_lba = self.next_lba; self.next_lba += 1
+
+            # Add boot images to the file tree
+            boot_image_nodes = self._add_boot_images()
+
             pvd_path_records, file_map = self._layout_hierarchy(is_joliet=False)
+
+            # Now that the boot images have extents, we can create the catalog
+            boot_catalog_lba = 0
+            if boot_image_nodes:
+                boot_entries = []
+                if 'bios' in boot_image_nodes:
+                    # platform_id, boot_media_type, load_segment, sector_count, lba
+                    boot_entries.append((0x00, 0, 0, 4, boot_image_nodes['bios']['extent_location']))
+                if 'efi' in boot_image_nodes:
+                    # For EFI, the load segment is 0 and sector count is file size / 512
+                    sector_count = math.ceil(boot_image_nodes['efi']['size'] / 512)
+                    boot_entries.append((0xef, 0, 0, sector_count, boot_image_nodes['efi']['extent_location']))
+
+                boot_catalog_data = self._generate_boot_catalog(boot_entries)
+                boot_catalog_lba = self._write_data_block(boot_catalog_data)
+
+            # Generate and write path tables and directory records
             pvd_l_path, pvd_m_path = self._generate_path_tables(pvd_path_records, False)
             pvd_l_path_lba = self._write_data_block(pvd_l_path)
             pvd_m_path_lba = self._write_data_block(pvd_m_path)
             self._write_directory_records_recursively(self.root_node, False)
+
             if self.use_joliet:
                 svd_path_records, _ = self._layout_hierarchy(is_joliet=True, file_map=file_map)
                 svd_l_path, svd_m_path = self._generate_path_tables(svd_path_records, True)
                 svd_l_path_lba = self._write_data_block(svd_l_path)
                 svd_m_path_lba = self._write_data_block(svd_m_path)
                 self._write_directory_records_recursively(self.root_node, True)
+
             volume_size_in_blocks = self.next_lba
-            pvd_data = self._generate_pvd(volume_size_in_blocks, pvd_l_path_lba, pvd_m_path_lba, len(pvd_l_path), False)
+
+            # Generate and write Volume Descriptors
+            pvd_data = self._generate_pvd(volume_size_in_blocks, pvd_l_path_lba, pvd_m_path_lba, len(pvd_l_path), False, boot_catalog_lba)
             self._write_data_at_lba(pvd_lba, pvd_data)
+
+            if self.boot_image_path or self.efi_boot_image_path:
+                bvd_data = self._generate_boot_record(boot_catalog_lba)
+                self._write_data_at_lba(bvd_lba, bvd_data)
+
             if self.use_joliet:
                 svd_data = self._generate_pvd(volume_size_in_blocks, svd_l_path_lba, svd_m_path_lba, len(svd_l_path), True)
                 self._write_data_at_lba(svd_lba, svd_data)
+
             terminator_data = self._generate_terminator()
             self._write_data_at_lba(terminator_lba, terminator_data)
+
         finally:
             if self.temp_file:
                 self.temp_file.close()
                 shutil.move(self.temp_file.name, self.output_path)
+
+    def _add_boot_images(self):
+        nodes = {}
+        # Handle BIOS boot image
+        if self.boot_image_path and os.path.exists(self.boot_image_path):
+            with open(self.boot_image_path, 'rb') as f:
+                boot_image_data = f.read()
+            bios_node = {
+                'name': 'BOOT.IMG',
+                'is_directory': False, 'is_hidden': True, 'size': len(boot_image_data),
+                'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
+                'children': [], 'parent': self.root_node, 'file_data': boot_image_data, 'is_new': True
+            }
+            self.root_node['children'].insert(0, bios_node)
+            nodes['bios'] = bios_node
+
+        # Handle EFI boot image
+        if self.efi_boot_image_path and os.path.exists(self.efi_boot_image_path):
+            with open(self.efi_boot_image_path, 'rb') as f:
+                efi_boot_image_data = f.read()
+            efi_node = {
+                'name': 'EFI.IMG',
+                'is_directory': False, 'is_hidden': True, 'size': len(efi_boot_image_data),
+                'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
+                'children': [], 'parent': self.root_node, 'file_data': efi_boot_image_data, 'is_new': True
+            }
+            self.root_node['children'].insert(0, efi_node)
+            nodes['efi'] = efi_node
+
+        return nodes
 
     def _write_data_at_lba(self, lba, data):
         self.temp_file.seek(lba * self.logical_block_size)
@@ -417,13 +504,19 @@ class ISOBuilder:
             rec[offset:offset+len(system_use_data)] = system_use_data
         return bytes(rec)
 
-    def _generate_pvd(self, volume_size, lba_l, lba_m, path_table_size, is_joliet=False):
+    def _generate_pvd(self, volume_size, lba_l, lba_m, path_table_size, is_joliet=False, boot_catalog_lba=0):
         vd = bytearray(self.logical_block_size)
         vd_type = 2 if is_joliet else 1
         encoding = 'utf-16-be' if is_joliet else 'ascii'
         root_record_data = self._create_dir_record(self.root_node, is_joliet, is_self=True)
+
         vd[0:1] = struct.pack('B', vd_type)
         vd[1:6] = b'CD001'; vd[6:7] = b'\x01'
+
+        # Pointer to Boot Catalog in PVD (El Torito)
+        if not is_joliet and boot_catalog_lba > 0:
+            vd[73:77] = struct.pack('<L', boot_catalog_lba)
+
         if is_joliet: vd[88:91] = b'%/@'
         vd[8:40] = _format_str_a("PYTHON TK ISO EDITOR", 32)
         vd[40:72] = self.volume_id.encode(encoding, 'ignore').ljust(32, b'\x00' if is_joliet else b' ')
@@ -438,6 +531,59 @@ class ISOBuilder:
         vd[190:318] = "ISO_SET".encode(encoding, 'ignore').ljust(128, b'\x00' if is_joliet else b' ')
         vd[881:882] = b'\x01'
         return vd
+
+    def _generate_boot_record(self, boot_catalog_lba):
+        # El Torito Boot Volume Descriptor
+        bvd = bytearray(self.logical_block_size)
+        bvd[0] = 0 # Boot Record
+        bvd[1:6] = b'CD001'
+        bvd[6] = 1 # Version
+        bvd[7:39] = b'EL TORITO SPECIFICATION'
+        bvd[72:76] = struct.pack('<L', boot_catalog_lba)
+        return bvd
+
+    def _generate_boot_catalog(self, boot_entries):
+        catalog = bytearray(self.logical_block_size)
+        offset = 0
+
+        # Validation Entry (always first)
+        catalog[offset] = 1  # Header ID
+        catalog[offset+1] = 0 # Platform ID (x86) - this is for the validation entry itself
+        catalog[offset+4:offset+32] = b'ISO EDITOR BOOT'
+
+        checksum = 0
+        for i in range(0, 32, 4):
+            checksum += struct.unpack('<L', catalog[offset+i:offset+i+4])[0]
+        checksum = (0x100000000 - checksum) & 0xFFFFFFFF
+        struct.pack_into('<L', catalog, offset+28, checksum)
+        catalog[offset+30] = 0x55
+        catalog[offset+31] = 0xAA
+        offset += 32
+
+        # Create Initial/Default and Section Entries for each boot image
+        is_first_entry = True
+        for platform_id, boot_media_type, load_segment, sector_count, lba in boot_entries:
+            if is_first_entry:
+                # Initial/Default Entry
+                catalog[offset] = 0x88 # Bootable
+                is_first_entry = False
+            else:
+                # Section Entry
+                catalog[offset] = 0x91 # Bootable (more entries follow) if not the last, 0x90 otherwise.
+                                     # Simplified for now, assuming this logic will be refined.
+
+            catalog[offset+1] = platform_id
+            struct.pack_into('<H', catalog, offset+2, 1) # Number of bootable entries for this spec
+            # No ID string for entries other than validation
+
+            # Entry details
+            struct.pack_into('<H', catalog, offset+4, load_segment)
+            catalog[offset+6] = boot_media_type
+            struct.pack_into('<H', catalog, offset+8, sector_count)
+            struct.pack_into('<L', catalog, offset+12, lba)
+            offset += 32
+
+        return catalog
 
     def _generate_terminator(self):
         terminator = bytearray(self.logical_block_size)
