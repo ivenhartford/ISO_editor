@@ -68,3 +68,57 @@ def test_remove_nonexistent_child(iso_core):
 
     assert len(root_node['children']) == 1
     assert root_node['children'][0]['name'] == "FOLDER1"
+
+def test_save_iso_with_boot_image(iso_core, tmp_path):
+    """
+    Test that saving an ISO with a boot image path runs without crashing.
+    This is a smoke test for the El Torito implementation.
+    """
+    # Create a dummy boot image file
+    boot_img_path = tmp_path / "boot.img"
+    boot_img_path.write_bytes(b'\x00' * 2048) # A simple 2k boot image
+
+    # Set the boot image path in the core
+    iso_core.boot_image_path = str(boot_img_path)
+
+    # Define an output path for the ISO
+    output_iso_path = tmp_path / "output.iso"
+
+    # Run the save operation
+    try:
+        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+    except Exception as e:
+        pytest.fail(f"save_iso raised an exception with a boot image: {e}")
+
+    # Check that the output ISO file was created
+    assert output_iso_path.exists()
+    assert output_iso_path.stat().st_size > 0
+
+def test_save_iso_with_hybrid_boot(iso_core, tmp_path):
+    """
+    Test that saving an ISO with both a BIOS and an EFI boot image
+    runs without crashing.
+    """
+    # Create dummy boot image files
+    bios_boot_path = tmp_path / "boot.img"
+    bios_boot_path.write_bytes(b'\x00' * 2048)
+
+    efi_boot_path = tmp_path / "efi.img"
+    efi_boot_path.write_bytes(b'\x00' * 4096)
+
+    # Set both boot image paths in the core
+    iso_core.boot_image_path = str(bios_boot_path)
+    iso_core.efi_boot_image_path = str(efi_boot_path)
+
+    # Define an output path for the ISO
+    output_iso_path = tmp_path / "output.iso"
+
+    # Run the save operation
+    try:
+        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+    except Exception as e:
+        pytest.fail(f"save_iso raised an exception with hybrid boot images: {e}")
+
+    # Check that the output ISO file was created
+    assert output_iso_path.exists()
+    assert output_iso_path.stat().st_size > 0

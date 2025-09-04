@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
     QFileDialog, QMessageBox, QInputDialog, QSplitter, QGroupBox,
-    QDialog, QDialogButtonBox, QLineEdit, QFormLayout
+    QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QPoint
@@ -12,28 +12,64 @@ import traceback
 from iso_logic import ISOCore
 
 class PropertiesDialog(QDialog):
-    def __init__(self, parent, volume_descriptor):
+    def __init__(self, parent, volume_descriptor, boot_image_path, efi_boot_image_path):
         super().__init__(parent)
         self.setWindowTitle("ISO Properties")
 
         self.layout = QFormLayout(self)
 
+        # Volume Properties
+        volume_group = QGroupBox("Volume Properties")
+        volume_layout = QFormLayout()
         self.volume_id_edit = QLineEdit(volume_descriptor.get('volume_id', ''))
         self.system_id_edit = QLineEdit(volume_descriptor.get('system_id', ''))
+        volume_layout.addRow("Volume ID:", self.volume_id_edit)
+        volume_layout.addRow("System ID:", self.system_id_edit)
+        volume_group.setLayout(volume_layout)
+        self.layout.addWidget(volume_group)
 
-        self.layout.addRow("Volume ID:", self.volume_id_edit)
-        self.layout.addRow("System ID:", self.system_id_edit)
+        # Boot Properties
+        boot_group = QGroupBox("Boot Options")
+        boot_form_layout = QFormLayout()
 
+        # BIOS Boot Image
+        self.boot_image_edit = QLineEdit(boot_image_path or '')
+        bios_browse_button = QPushButton("Browse...")
+        bios_browse_button.clicked.connect(lambda: self.browse_for_image(self.boot_image_edit, "Select BIOS Boot Image"))
+        bios_boot_layout = QHBoxLayout()
+        bios_boot_layout.addWidget(self.boot_image_edit)
+        bios_boot_layout.addWidget(bios_browse_button)
+        boot_form_layout.addRow("BIOS Boot Image:", bios_boot_layout)
+
+        # EFI Boot Image
+        self.efi_boot_image_edit = QLineEdit(efi_boot_image_path or '')
+        efi_browse_button = QPushButton("Browse...")
+        efi_browse_button.clicked.connect(lambda: self.browse_for_image(self.efi_boot_image_edit, "Select EFI Boot Image"))
+        efi_boot_layout = QHBoxLayout()
+        efi_boot_layout.addWidget(self.efi_boot_image_edit)
+        efi_boot_layout.addWidget(efi_browse_button)
+        boot_form_layout.addRow("EFI Boot Image:", efi_boot_layout)
+
+        boot_group.setLayout(boot_form_layout)
+        self.layout.addWidget(boot_group)
+
+        # Dialog Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
-
         self.layout.addWidget(self.buttons)
+
+    def browse_for_image(self, line_edit, title):
+        file_path, _ = QFileDialog.getOpenFileName(self, title, "", "Boot Images (*.img *.bin);;All Files (*)")
+        if file_path:
+            line_edit.setText(file_path)
 
     def get_properties(self):
         return {
             'volume_id': self.volume_id_edit.text(),
-            'system_id': self.system_id_edit.text()
+            'system_id': self.system_id_edit.text(),
+            'boot_image_path': self.boot_image_edit.text(),
+            'efi_boot_image_path': self.efi_boot_image_edit.text()
         }
 
 class ISOEditor(QMainWindow):
@@ -348,13 +384,22 @@ class ISOEditor(QMainWindow):
             QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
             return
 
-        dialog = PropertiesDialog(self, self.core.volume_descriptor)
+        dialog = PropertiesDialog(self, self.core.volume_descriptor, self.core.boot_image_path, self.core.efi_boot_image_path)
         if dialog.exec():
             new_props = dialog.get_properties()
-            self.core.volume_descriptor['volume_id'] = new_props['volume_id']
-            self.core.volume_descriptor['system_id'] = new_props['system_id']
-            self.core.iso_modified = True
-            self.refresh_view()
+
+            # Check if anything has changed to set the modified flag
+            if (self.core.volume_descriptor.get('volume_id') != new_props['volume_id'] or
+                self.core.volume_descriptor.get('system_id') != new_props['system_id'] or
+                self.core.boot_image_path != new_props['boot_image_path'] or
+                self.core.efi_boot_image_path != new_props['efi_boot_image_path']):
+
+                self.core.volume_descriptor['volume_id'] = new_props['volume_id']
+                self.core.volume_descriptor['system_id'] = new_props['system_id']
+                self.core.boot_image_path = new_props['boot_image_path']
+                self.core.efi_boot_image_path = new_props['efi_boot_image_path']
+                self.core.iso_modified = True
+                self.refresh_view()
 
     def refresh_view(self):
         self.tree.clear()
