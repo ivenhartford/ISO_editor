@@ -69,7 +69,8 @@ class ISOCore:
             use_rock_ridge=use_rock_ridge,
             boot_image_path=self.boot_image_path,
             efi_boot_image_path=self.efi_boot_image_path,
-            boot_emulation_type=self.boot_emulation_type
+            boot_emulation_type=self.boot_emulation_type,
+            core=self
         )
         builder.build()
         self.current_iso_path = output_path
@@ -286,7 +287,7 @@ class ISOBuilder:
     def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
                  use_joliet=True, use_rock_ridge=True,
                  boot_image_path=None, efi_boot_image_path=None,
-                 boot_emulation_type='no_emulation'):
+                 boot_emulation_type='no_emulation', core=None):
         self.root_node = root_node
         self.output_path = output_path
         self.volume_id = volume_id
@@ -298,6 +299,7 @@ class ISOBuilder:
         self.logical_block_size = 2048
         self.next_lba = 0
         self.temp_file = None
+        self.core = core
 
     def build(self):
         self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
@@ -440,7 +442,7 @@ class ISOBuilder:
                     if not child['is_directory']:
                         child_id = id(child)
                         if child_id not in file_map:
-                            file_data = child.get('file_data', b'')
+                            file_data = self.core.get_file_data(child)
                             child['extent_location'] = self._write_data_block(file_data)
                             file_map[child_id] = child['extent_location']
                         else: child['extent_location'] = file_map[child_id]
@@ -467,10 +469,10 @@ class ISOBuilder:
             name = self._get_short_name(node['name']) if not is_joliet else node['name']
             dir_id = b'\x00' if name == '/' else name.encode('utf-16-be' if is_joliet else 'ascii')
             id_len = len(dir_id)
-            l_rec = struct.pack('<BB<L<H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            l_rec = struct.pack('<BBLH', id_len, 0, extent_loc, parent_dir_num) + dir_id
             if id_len % 2 != 0: l_rec += b'\x00'
             l_table.extend(l_rec)
-            m_rec = struct.pack('<BB>L>H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            m_rec = struct.pack('>BBLH', id_len, 0, extent_loc, parent_dir_num) + dir_id
             if id_len % 2 != 0: m_rec += b'\x00'
             m_table.extend(m_rec)
         return bytes(l_table), bytes(m_table)
