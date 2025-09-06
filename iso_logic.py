@@ -48,10 +48,17 @@ class ISOCore:
 
     def load_iso(self, file_path):
         self.close_iso()
-        self.current_iso_path = file_path
-        self.iso_file_handle = open(file_path, 'rb')
-        self.parse_iso_structure()
-        self.iso_modified = False
+        try:
+            self.iso_file_handle = open(file_path, 'rb')
+            self.current_iso_path = file_path
+            self.parse_iso_structure()
+            self.iso_modified = False
+        except FileNotFoundError:
+            self.init_new_iso()
+            raise IOError(f"ISO file not found at path: {file_path}")
+        except Exception as e:
+            self.init_new_iso()
+            raise e
 
     def save_iso(self, output_path, use_joliet, use_rock_ridge):
         builder = ISOBuilder(
@@ -62,7 +69,8 @@ class ISOCore:
             use_rock_ridge=use_rock_ridge,
             boot_image_path=self.boot_image_path,
             efi_boot_image_path=self.efi_boot_image_path,
-            boot_emulation_type=self.boot_emulation_type
+            boot_emulation_type=self.boot_emulation_type,
+            core=self
         )
         builder.build()
         self.current_iso_path = output_path
@@ -155,7 +163,12 @@ class ISOCore:
 
     def build_directory_tree(self):
         if not self.root_directory: return {}
-        tree = {'name': '/', 'is_directory': True, 'children': [], 'parent': None}
+        tree = {
+            'name': '/', 'is_directory': True, 'children': [], 'parent': None,
+            'extent_location': self.root_directory.get('extent_location', 0),
+            'date': self.root_directory.get('recording_date', '')
+        }
+        tree['parent'] = tree
         for entry in self.read_directory_entries(self.root_directory['extent_location']):
             if entry['file_id'] in ['.', '..']: continue
             node = {
@@ -210,7 +223,10 @@ class ISOCore:
 
     def add_file_to_directory(self, file_path, target_node):
         filename = os.path.basename(file_path)
-        with open(file_path, 'rb') as f: file_data = f.read()
+        try:
+            with open(file_path, 'rb') as f: file_data = f.read()
+        except FileNotFoundError:
+            raise IOError(f"File not found: {file_path}")
         file_stats = os.stat(file_path)
         new_node = {
             'name': filename, 'is_directory': False, 'is_hidden': False,
@@ -271,7 +287,7 @@ class ISOBuilder:
     def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
                  use_joliet=True, use_rock_ridge=True,
                  boot_image_path=None, efi_boot_image_path=None,
-                 boot_emulation_type='no_emulation'):
+                 boot_emulation_type='no_emulation', core=None):
         self.root_node = root_node
         self.output_path = output_path
         self.volume_id = volume_id
@@ -283,6 +299,7 @@ class ISOBuilder:
         self.logical_block_size = 2048
         self.next_lba = 0
         self.temp_file = None
+        self.core = core
 
     def build(self):
         self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
@@ -358,8 +375,11 @@ class ISOBuilder:
         nodes = {}
         # Handle BIOS boot image
         if self.boot_image_path and os.path.exists(self.boot_image_path):
-            with open(self.boot_image_path, 'rb') as f:
-                boot_image_data = f.read()
+            try:
+                with open(self.boot_image_path, 'rb') as f:
+                    boot_image_data = f.read()
+            except FileNotFoundError:
+                raise IOError(f"Boot image not found: {self.boot_image_path}")
             bios_node = {
                 'name': 'BOOT.IMG',
                 'is_directory': False, 'is_hidden': True, 'size': len(boot_image_data),
@@ -371,8 +391,11 @@ class ISOBuilder:
 
         # Handle EFI boot image
         if self.efi_boot_image_path and os.path.exists(self.efi_boot_image_path):
-            with open(self.efi_boot_image_path, 'rb') as f:
-                efi_boot_image_data = f.read()
+            try:
+                with open(self.efi_boot_image_path, 'rb') as f:
+                    efi_boot_image_data = f.read()
+            except FileNotFoundError:
+                raise IOError(f"EFI boot image not found: {self.efi_boot_image_path}")
             efi_node = {
                 'name': 'EFI.IMG',
                 'is_directory': False, 'is_hidden': True, 'size': len(efi_boot_image_data),
@@ -419,7 +442,7 @@ class ISOBuilder:
                     if not child['is_directory']:
                         child_id = id(child)
                         if child_id not in file_map:
-                            file_data = child.get('file_data', b'')
+                            file_data = self.core.get_file_data(child)
                             child['extent_location'] = self._write_data_block(file_data)
                             file_map[child_id] = child['extent_location']
                         else: child['extent_location'] = file_map[child_id]
@@ -446,10 +469,10 @@ class ISOBuilder:
             name = self._get_short_name(node['name']) if not is_joliet else node['name']
             dir_id = b'\x00' if name == '/' else name.encode('utf-16-be' if is_joliet else 'ascii')
             id_len = len(dir_id)
-            l_rec = struct.pack('<BB<L<H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            l_rec = struct.pack('<BBLH', id_len, 0, extent_loc, parent_dir_num) + dir_id
             if id_len % 2 != 0: l_rec += b'\x00'
             l_table.extend(l_rec)
-            m_rec = struct.pack('<BB>L>H', id_len, 0, extent_loc, parent_dir_num) + dir_id
+            m_rec = struct.pack('>BBLH', id_len, 0, extent_loc, parent_dir_num) + dir_id
             if id_len % 2 != 0: m_rec += b'\x00'
             m_table.extend(m_rec)
         return bytes(l_table), bytes(m_table)
@@ -591,10 +614,11 @@ class ISOBuilder:
         return terminator
 
     def get_node_path(self, node):
-        if not node.get('parent'): return '/'
+        if not node.get('parent') or node.get('parent') is node:
+            return '/'
         path_parts = []
         current = node
-        while current and current.get('parent'):
+        while current and current.get('parent') and current.get('parent') is not current:
             path_parts.append(current['name'])
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts))
