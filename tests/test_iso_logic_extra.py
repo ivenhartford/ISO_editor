@@ -186,3 +186,81 @@ def test_remove_node_with_no_parent(iso_core):
     node = {'name': 'no_parent.txt'}
     # This should not raise an exception
     iso_core.remove_node(node)
+
+def test_load_iso_after_save(iso_core, tmp_path):
+    """
+    Test that loading an ISO after saving it results in the same structure.
+    This is an integration test for the parser and builder.
+    """
+    # 1. Build a known structure
+    root_node = iso_core.directory_tree
+    iso_core.add_folder_to_directory("DIR1", root_node)
+
+    file1_content = b"file1"
+    file1_path = tmp_path / "file1.txt"
+    file1_path.write_bytes(file1_content)
+    iso_core.add_file_to_directory(str(file1_path), root_node.get('children')[0])
+
+    file2_content = b"file2"
+    file2_path = tmp_path / "file2.txt"
+    file2_path.write_bytes(file2_content)
+    iso_core.add_file_to_directory(str(file2_path), root_node)
+
+    # 2. Save the ISO
+    output_iso_path = tmp_path / "test.iso"
+    iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+
+    # 3. Load the ISO into a new ISOCore instance
+    new_iso_core = ISOCore()
+    new_iso_core.load_iso(str(output_iso_path))
+
+    # 4. Assert the structure is the same
+    new_root = new_iso_core.directory_tree
+    assert len(new_root['children']) == 2
+
+    dir1 = next((c for c in new_root['children'] if c['name'] == 'DIR1'), None)
+    assert dir1 is not None
+    assert dir1['is_directory'] is True
+
+    file2 = next((c for c in new_root['children'] if c['name'] == 'file2.txt'), None)
+    assert file2 is not None
+    assert file2['is_directory'] is False
+    assert file2['size'] == len(file2_content)
+
+    assert len(dir1['children']) == 1
+    file1 = dir1['children'][0]
+    assert file1['name'] == 'file1.txt'
+    assert file1['is_directory'] is False
+    assert file1['size'] == len(file1_content)
+
+    # Also test get_file_data on the loaded ISO
+    assert new_iso_core.get_file_data(file1) == file1_content
+    assert new_iso_core.get_file_data(file2) == file2_content
+
+def test_load_nonexistent_iso(iso_core):
+    """Test that loading a non-existent ISO raises an error."""
+    with pytest.raises(IOError):
+        iso_core.load_iso("nonexistent.iso")
+
+def test_load_invalid_iso(iso_core, tmp_path):
+    """Test that loading an invalid ISO file raises an error."""
+    invalid_iso_path = tmp_path / "invalid.iso"
+    invalid_iso_path.write_bytes(b"this is not an iso file")
+    with pytest.raises(Exception):
+        iso_core.load_iso(str(invalid_iso_path))
+
+def test_close_iso(iso_core, tmp_path):
+    """Test that the close_iso method closes the file handle."""
+    # First, create and load a valid ISO to have an open file handle
+    iso_path = tmp_path / "test.iso"
+    iso_core.save_iso(str(iso_path), use_joliet=False, use_rock_ridge=False)
+
+    # Load it to open the handle
+    loaded_core = ISOCore()
+    loaded_core.load_iso(str(iso_path))
+    assert loaded_core.iso_file_handle is not None
+    assert not loaded_core.iso_file_handle.closed
+
+    # Close it
+    loaded_core.close_iso()
+    assert loaded_core.iso_file_handle is None

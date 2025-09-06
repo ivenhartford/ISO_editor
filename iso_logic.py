@@ -272,17 +272,25 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': tree
             }
-            if entry['is_directory']: self.build_directory_subtree(node)
+            if entry['is_directory']: self.build_directory_subtree(node, {self.root_directory['extent_location']})
             tree['children'].append(node)
         return tree
 
-    def build_directory_subtree(self, parent_node):
+    def build_directory_subtree(self, parent_node, visited_extents=None):
         """
         Recursively builds a subtree for a given directory node.
 
         Args:
             parent_node (dict): The parent directory node to build the subtree from.
+            visited_extents (set, optional): A set of visited extent locations to prevent infinite loops.
         """
+        if visited_extents is None:
+            visited_extents = set()
+
+        if parent_node['extent_location'] in visited_extents:
+            return
+        visited_extents.add(parent_node['extent_location'])
+
         for entry in self.read_directory_entries(parent_node['extent_location']):
             if entry['file_id'] in ['.', '..']: continue
             node = {
@@ -291,8 +299,8 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': parent_node
             }
-            if entry['is_directory'] and len(parent_node['name']) < 50:
-                self.build_directory_subtree(node)
+            if entry['is_directory']:
+                self.build_directory_subtree(node, visited_extents)
             parent_node['children'].append(node)
 
     def read_directory_entries(self, extent_location):
