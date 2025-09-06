@@ -167,6 +167,7 @@ class ISOCore:
             'extent_location': self.root_directory.get('extent_location', 0),
             'date': self.root_directory.get('recording_date', '')
         }
+        tree['parent'] = tree
         for entry in self.read_directory_entries(self.root_directory['extent_location']):
             if entry['file_id'] in ['.', '..']: continue
             node = {
@@ -611,10 +612,11 @@ class ISOBuilder:
         return terminator
 
     def get_node_path(self, node):
-        if not node.get('parent'): return '/'
+        if not node.get('parent') or node.get('parent') is node:
+            return '/'
         path_parts = []
         current = node
-        while current and current.get('parent'):
+        while current and current.get('parent') and current.get('parent') is not current:
             path_parts.append(current['name'])
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts))

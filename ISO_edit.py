@@ -6,7 +6,35 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton
 )
 from PySide6.QtGui import QAction
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtCore import Qt, QPoint, Signal
+
+class DroppableTreeWidget(QTreeWidget):
+    filesDropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = [url.toLocalFile() for url in event.mimeData().urls()]
+            if urls:
+                self.filesDropped.emit(urls)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 import os
 import traceback
 from iso_logic import ISOCore
@@ -174,8 +202,9 @@ class ISOEditor(QMainWindow):
         right_pane = QGroupBox("ISO Contents")
         right_layout = QVBoxLayout(right_pane)
 
-        self.tree = QTreeWidget()
+        self.tree = DroppableTreeWidget()
         self.tree.setHeaderLabels(['Name', 'Size', 'Date Modified', 'Type'])
+        self.tree.filesDropped.connect(self.handle_drop)
         self.tree.setColumnWidth(0, 300)
         self.tree.setColumnWidth(1, 100)
         self.tree.setColumnWidth(2, 150)
@@ -358,6 +387,37 @@ class ISOEditor(QMainWindow):
             os.makedirs(os.path.dirname(extract_path), exist_ok=True)
             with open(extract_path, 'wb') as f:
                 f.write(file_data)
+
+    def handle_drop(self, urls):
+        target_node = self.get_selected_node() or self.core.directory_tree
+        if not target_node['is_directory']:
+            target_node = target_node['parent']
+
+        for url in urls:
+            if os.path.isfile(url):
+                self.core.add_file_to_directory(url, target_node)
+            elif os.path.isdir(url):
+                self._import_directory_recursive(url, target_node)
+
+        self.refresh_view()
+        self.update_status(f"Added {len(urls)} items via drag and drop.")
+
+    def _import_directory_recursive(self, source_dir, target_node):
+        dir_name = os.path.basename(source_dir)
+        # Avoid creating a folder if one with the same name already exists.
+        existing_folder = next((c for c in target_node['children'] if c['name'].lower() == dir_name.lower() and c['is_directory']), None)
+        if existing_folder:
+            new_dir_node = existing_folder
+        else:
+            self.core.add_folder_to_directory(dir_name, target_node)
+            new_dir_node = next(c for c in target_node['children'] if c['name'] == dir_name and c.get('is_new'))
+
+        for item in os.listdir(source_dir):
+            item_path = os.path.join(source_dir, item)
+            if os.path.isfile(item_path):
+                self.core.add_file_to_directory(item_path, new_dir_node)
+            elif os.path.isdir(item_path):
+                self._import_directory_recursive(item_path, new_dir_node)
 
     def show_context_menu(self, position: QPoint):
         item = self.tree.itemAt(position)
