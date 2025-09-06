@@ -4,6 +4,9 @@ from datetime import datetime
 import tempfile
 import shutil
 import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ISOCore:
     def __init__(self):
@@ -21,6 +24,7 @@ class ISOCore:
         self.init_new_iso()
 
     def init_new_iso(self):
+        logger.info("Initializing new ISO structure.")
         self.close_iso()
         self.current_iso_path = None
         self.boot_image_path = None
@@ -43,10 +47,12 @@ class ISOCore:
 
     def close_iso(self):
         if self.iso_file_handle:
+            logger.info(f"Closing ISO file: {self.current_iso_path}")
             self.iso_file_handle.close()
             self.iso_file_handle = None
 
     def load_iso(self, file_path):
+        logger.info(f"Loading ISO from path: {file_path}")
         self.close_iso()
         try:
             self.iso_file_handle = open(file_path, 'rb')
@@ -61,6 +67,7 @@ class ISOCore:
             raise e
 
     def save_iso(self, output_path, use_joliet, use_rock_ridge):
+        logger.info(f"Saving ISO to: {output_path}")
         builder = ISOBuilder(
             root_node=self.directory_tree,
             output_path=output_path,
@@ -71,9 +78,14 @@ class ISOCore:
             efi_boot_image_path=self.efi_boot_image_path,
             boot_emulation_type=self.boot_emulation_type
         )
-        builder.build()
-        self.current_iso_path = output_path
-        self.iso_modified = False
+        try:
+            builder.build()
+            self.current_iso_path = output_path
+            self.iso_modified = False
+            logger.info("ISO saved successfully.")
+        except Exception as e:
+            logger.error(f"Failed to build or save ISO: {e}", exc_info=True)
+            raise
 
     def parse_iso_structure(self):
         pvd, joliet_svd = None, None
@@ -221,6 +233,7 @@ class ISOCore:
             with open(file_path, 'rb') as f: file_data = f.read()
         except FileNotFoundError:
             raise IOError(f"File not found: {file_path}")
+            
         file_stats = os.stat(file_path)
         new_node = {
             'name': filename, 'is_directory': False, 'is_hidden': False,
@@ -233,6 +246,7 @@ class ISOCore:
         self.iso_modified = True
 
     def add_folder_to_directory(self, folder_name, target_node):
+        logger.info(f"Adding folder '{folder_name}' to directory '{target_node['name']}'")
         new_node = {
             'name': folder_name, 'is_directory': True, 'is_hidden': False, 'size': 0,
             'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
@@ -244,8 +258,11 @@ class ISOCore:
     def remove_node(self, node_to_remove):
         parent = node_to_remove.get('parent')
         if parent:
+            logger.info(f"Removing node '{node_to_remove['name']}' from '{parent['name']}'")
             parent['children'] = [c for c in parent['children'] if id(c) != id(node_to_remove)]
             self.iso_modified = True
+        else:
+            logger.warning(f"Attempted to remove node '{node_to_remove['name']}' which has no parent.")
 
     def calculate_next_extent_location(self):
         max_extent = 0
@@ -295,9 +312,16 @@ class ISOBuilder:
         self.temp_file = None
 
     def build(self):
+        logger.info(f"Starting ISO build for output: {self.output_path}")
+        logger.info(f"Using Joliet: {self.use_joliet}, Rock Ridge: {self.use_rock_ridge}")
+        if self.boot_image_path:
+            logger.info(f"BIOS boot image: {self.boot_image_path}")
+        if self.efi_boot_image_path:
+            logger.info(f"EFI boot image: {self.efi_boot_image_path}")
+
         self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
         try:
-            # Reserve space for system area
+            logger.debug("Reserving system area (16 blocks).")
             self.temp_file.seek(16 * self.logical_block_size)
             self.next_lba = 16
 
