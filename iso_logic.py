@@ -7,6 +7,7 @@ import math
 import logging
 import pycdlib
 from io import BytesIO
+import posixpath
 
 logger = logging.getLogger(__name__)
 
@@ -271,17 +272,25 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': tree
             }
-            if entry['is_directory']: self.build_directory_subtree(node)
+            if entry['is_directory']: self.build_directory_subtree(node, {self.root_directory['extent_location']})
             tree['children'].append(node)
         return tree
 
-    def build_directory_subtree(self, parent_node):
+    def build_directory_subtree(self, parent_node, visited_extents=None):
         """
         Recursively builds a subtree for a given directory node.
 
         Args:
             parent_node (dict): The parent directory node to build the subtree from.
+            visited_extents (set, optional): A set of visited extent locations to prevent infinite loops.
         """
+        if visited_extents is None:
+            visited_extents = set()
+
+        if parent_node['extent_location'] in visited_extents:
+            return
+        visited_extents.add(parent_node['extent_location'])
+
         for entry in self.read_directory_entries(parent_node['extent_location']):
             if entry['file_id'] in ['.', '..']: continue
             node = {
@@ -290,8 +299,8 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': parent_node
             }
-            if entry['is_directory'] and len(parent_node['name']) < 50:
-                self.build_directory_subtree(node)
+            if entry['is_directory']:
+                self.build_directory_subtree(node, visited_extents)
             parent_node['children'].append(node)
 
     def read_directory_entries(self, extent_location):
@@ -355,6 +364,9 @@ class ISOCore:
             file_path (str): The path to the local file to add.
             target_node (dict): The target directory node in the ISO tree.
         """
+        if not target_node['is_directory']:
+            target_node = target_node['parent']
+
         logger.info(f"Adding file '{file_path}' to '{self.get_node_path(target_node)}'")
         filename = os.path.basename(file_path)
         try:
@@ -383,6 +395,12 @@ class ISOCore:
             target_node (dict): The target directory node in the ISO tree.
         """
         logger.info(f"Adding folder '{folder_name}' to '{self.get_node_path(target_node)}'")
+
+        # Check if a folder with the same name already exists
+        if any(c['name'].lower() == folder_name.lower() and c['is_directory'] for c in target_node['children']):
+            logger.warning(f"Folder '{folder_name}' already exists in '{self.get_node_path(target_node)}'")
+            return
+
         new_node = {
             'name': folder_name, 'is_directory': True, 'is_hidden': False, 'size': 0,
             'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
@@ -463,6 +481,7 @@ class ISOBuilder:
         logger.info("Starting ISO build process with pycdlib.")
 
         self.iso.new(
+            interchange_level=3,
             vol_ident=self.volume_id,
             joliet=3 if self.use_joliet else None,
             rock_ridge='1.09' if self.use_rock_ridge else None
@@ -483,9 +502,9 @@ class ISOBuilder:
         """
         for child in node['children']:
             child_iso_name = child['name'].upper()
-            child_iso_path = os.path.join(iso_path, child_iso_name)
+            child_iso_path = posixpath.join(iso_path, child_iso_name)
 
-            joliet_path = os.path.join(iso_path, child['name'])
+            joliet_path = posixpath.join(iso_path, child['name'])
             rr_name = child['name']
 
             if child['is_directory']:
