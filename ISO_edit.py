@@ -1,4 +1,5 @@
 import sys
+import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -7,27 +8,59 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QPoint, Signal
+import os
+import traceback
+from iso_logic import ISOCore
+
+logger = logging.getLogger(__name__)
 
 class DroppableTreeWidget(QTreeWidget):
+    """
+    A QTreeWidget that supports drag and drop of files and folders.
+    """
     filesDropped = Signal(list)
 
     def __init__(self, parent=None):
+        """
+        Initializes the DroppableTreeWidget.
+
+        Args:
+            parent (QWidget, optional): The parent widget.
+        """
         super().__init__(parent)
         self.setAcceptDrops(True)
 
     def dragEnterEvent(self, event):
+        """
+        Handles the drag enter event. Accepts the event if it contains URLs.
+
+        Args:
+            event (QDragEnterEvent): The drag enter event.
+        """
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        """
+        Handles the drag move event. Accepts the event if it contains URLs.
+
+        Args:
+            event (QDragMoveEvent): The drag move event.
+        """
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):
+        """
+        Handles the drop event. Emits a signal with the list of dropped file paths.
+
+        Args:
+            event (QDropEvent): The drop event.
+        """
         if event.mimeData().hasUrls():
             urls = [url.toLocalFile() for url in event.mimeData().urls()]
             if urls:
@@ -35,12 +68,21 @@ class DroppableTreeWidget(QTreeWidget):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
-import os
-import traceback
-from iso_logic import ISOCore
 
 class PropertiesDialog(QDialog):
+    """
+    A dialog for editing ISO properties, such as volume ID and boot options.
+    """
     def __init__(self, parent, volume_descriptor, boot_image_path, efi_boot_image_path):
+        """
+        Initializes the PropertiesDialog.
+
+        Args:
+            parent (QWidget): The parent widget.
+            volume_descriptor (dict): The current volume descriptor of the ISO.
+            boot_image_path (str): The path to the BIOS boot image.
+            efi_boot_image_path (str): The path to the EFI boot image.
+        """
         super().__init__(parent)
         self.setWindowTitle("ISO Properties")
 
@@ -88,11 +130,24 @@ class PropertiesDialog(QDialog):
         self.layout.addWidget(self.buttons)
 
     def browse_for_image(self, line_edit, title):
+        """
+        Opens a file dialog to browse for a boot image.
+
+        Args:
+            line_edit (QLineEdit): The line edit to set the file path in.
+            title (str): The title of the file dialog.
+        """
         file_path, _ = QFileDialog.getOpenFileName(self, title, "", "Boot Images (*.img *.bin);;All Files (*)")
         if file_path:
             line_edit.setText(file_path)
 
     def get_properties(self):
+        """
+        Gets the updated properties from the dialog.
+
+        Returns:
+            dict: A dictionary of the updated properties.
+        """
         return {
             'volume_id': self.volume_id_edit.text(),
             'system_id': self.system_id_edit.text(),
@@ -101,7 +156,11 @@ class PropertiesDialog(QDialog):
         }
 
 class ISOEditor(QMainWindow):
+    """
+    The main window of the ISO Editor application.
+    """
     def __init__(self):
+        """Initializes the ISOEditor main window."""
         super().__init__()
         self.setWindowTitle("ISO Editor")
         self.setGeometry(100, 100, 800, 600)
@@ -115,6 +174,7 @@ class ISOEditor(QMainWindow):
         self.refresh_view()
 
     def create_menu(self):
+        """Creates the main menu bar."""
         menu_bar = self.menuBar()
 
         # File Menu
@@ -177,6 +237,7 @@ class ISOEditor(QMainWindow):
         view_menu.addAction(refresh_action)
 
     def create_main_interface(self):
+        """Creates the main user interface of the application."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -219,27 +280,41 @@ class ISOEditor(QMainWindow):
         main_layout.addWidget(splitter)
 
     def create_status_bar(self):
+        """Creates the status bar."""
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.update_status("Ready")
 
     def update_status(self, message):
+        """
+        Updates the message in the status bar.
+
+        Args:
+            message (str): The message to display.
+        """
         modified_indicator = " [Modified]" if self.core.iso_modified else ""
         self.status_bar.showMessage(f"{message}{modified_indicator}")
 
     def open_iso(self):
+        """Opens an ISO file and loads it into the editor."""
+        logger.info("Open ISO action triggered.")
         file_path, _ = QFileDialog.getOpenFileName(self, "Open ISO", "", "ISO Files (*.iso);;All Files (*)")
         if not file_path:
+            logger.info("Open ISO dialog cancelled.")
             return
         try:
             self.core.load_iso(file_path)
             self.refresh_view()
             self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
+            logger.info(f"Successfully loaded ISO: {file_path}")
         except Exception as e:
+            logger.exception(f"Failed to load ISO: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
             self.update_status("Error loading ISO")
 
     def new_iso(self):
+        """Creates a new, empty ISO."""
+        logger.info("New ISO action triggered.")
         if self.core.iso_modified:
             reply = QMessageBox.question(self, "Unsaved Changes",
                                            "Save changes before creating a new ISO?",
@@ -253,66 +328,98 @@ class ISOEditor(QMainWindow):
         self.core.init_new_iso()
         self.refresh_view()
         self.update_status("Created new empty ISO.")
+        logger.info("New empty ISO created.")
 
     def save_iso(self):
+        """Saves the current ISO to its existing path."""
+        logger.info("Save ISO action triggered.")
         if not self.core.current_iso_path:
             self.save_iso_as()
         else:
             self._perform_save(self.core.current_iso_path)
 
     def save_iso_as(self):
+        """Saves the current ISO to a new path."""
+        logger.info("Save ISO As action triggered.")
         file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
         if file_path:
             self._perform_save(file_path)
+        else:
+            logger.info("Save As dialog cancelled.")
 
     def _perform_save(self, file_path):
+        """
+        Performs the save operation.
+
+        Args:
+            file_path (str): The path to save the ISO to.
+        """
+        logger.info(f"Attempting to save ISO to {file_path}")
         self.update_status("Building ISO...")
         try:
             self.core.save_iso(file_path, use_joliet=True, use_rock_ridge=True)
             self.refresh_view()
             self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
+            logger.info(f"ISO saved successfully to {file_path}")
             QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
         except Exception as e:
-            traceback.print_exc()
+            logger.exception(f"An error occurred while saving the ISO to {file_path}")
             QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {str(e)}")
             self.update_status("Error saving ISO.")
 
     def get_selected_node(self):
+        """
+        Gets the currently selected node in the tree view.
+
+        Returns:
+            dict or None: The selected node, or None if no node is selected.
+        """
         selected_items = self.tree.selectedItems()
         if not selected_items:
             return None
         return self.tree_item_map.get(id(selected_items[0]))
 
     def add_file(self):
+        """Adds a file to the ISO."""
+        logger.info("Add File action triggered.")
         target_node = self.get_selected_node() or self.core.directory_tree
         if not target_node['is_directory']:
             target_node = target_node['parent']
 
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Files")
         if not file_paths:
+            logger.info("Add Files dialog cancelled.")
             return
 
         for fp in file_paths:
-            if any(c['name'].lower() == os.path.basename(fp).lower() for c in target_node['children']):
-                reply = QMessageBox.question(self, "File Exists", f"File '{os.path.basename(fp)}' already exists. Replace it?",
-                                               QMessageBox.Yes | QMessageBox.No)
-                if reply == QMessageBox.No:
-                    continue
-            self.core.add_file_to_directory(fp, target_node)
+            try:
+                if any(c['name'].lower() == os.path.basename(fp).lower() for c in target_node['children']):
+                    reply = QMessageBox.question(self, "File Exists", f"File '{os.path.basename(fp)}' already exists. Replace it?",
+                                                   QMessageBox.Yes | QMessageBox.No)
+                    if reply == QMessageBox.No:
+                        continue
+                self.core.add_file_to_directory(fp, target_node)
+            except Exception as e:
+                logger.exception(f"Failed to add file {fp}: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to add file {os.path.basename(fp)}: {e}")
 
         self.refresh_view()
         self.update_status(f"Added {len(file_paths)} file(s)")
 
     def add_folder(self):
+        """Adds a folder to the ISO."""
+        logger.info("Add Folder action triggered.")
         target_node = self.get_selected_node() or self.core.directory_tree
         if not target_node['is_directory']:
             target_node = target_node['parent']
 
         folder_name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
         if not ok or not folder_name:
+            logger.info("Add Folder dialog cancelled.")
             return
 
         if any(c['name'].lower() == folder_name.lower() for c in target_node['children']):
+            logger.warning(f"Attempted to create a folder with an existing name: {folder_name}")
             QMessageBox.critical(self, "Folder Exists", f"Folder '{folder_name}' already exists.")
             return
 
@@ -320,43 +427,49 @@ class ISOEditor(QMainWindow):
         self.refresh_view()
 
     def remove_selected(self):
+        """Removes the selected file or folder from the ISO."""
+        logger.info("Remove Selected action triggered.")
         node = self.get_selected_node()
         if not node or node == self.core.directory_tree:
+            logger.debug("Remove selected called with no valid node selected.")
             return
 
         reply = QMessageBox.question(self, "Confirm Removal", f"Are you sure you want to remove '{node['name']}'?",
                                        QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            logger.info(f"User confirmed removal of node: {node['name']}")
             self.core.remove_node(node)
             self.refresh_view()
+        else:
+            logger.info(f"User cancelled removal of node: {node['name']}")
 
     def import_directory(self):
+        """Imports a directory from the local filesystem into the ISO."""
+        logger.info("Import Directory action triggered.")
         target_node = self.get_selected_node() or self.core.directory_tree
         if not target_node['is_directory']:
             target_node = target_node['parent']
 
         source_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Import")
         if not source_dir:
+            logger.info("Import Directory dialog cancelled.")
             return
 
-        def import_recursive(source, target):
-            dir_name = os.path.basename(source)
-            self.core.add_folder_to_directory(dir_name, target)
-            new_dir_node = next(c for c in target['children'] if c['name'] == dir_name and c.get('is_new'))
-            for item in os.listdir(source):
-                item_path = os.path.join(source, item)
-                if os.path.isfile(item_path):
-                    self.core.add_file_to_directory(item_path, new_dir_node)
-                elif os.path.isdir(item_path):
-                    import_recursive(item_path, new_dir_node)
-
-        import_recursive(source_dir, target_node)
-        self.refresh_view()
-        self.update_status(f"Imported directory '{os.path.basename(source_dir)}'")
+        try:
+            self._import_directory_recursive(source_dir, target_node)
+            self.refresh_view()
+            self.update_status(f"Imported directory '{os.path.basename(source_dir)}'")
+            logger.info(f"Successfully imported directory: {source_dir}")
+        except Exception as e:
+            logger.exception(f"Failed to import directory {source_dir}: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to import directory: {e}")
 
     def extract_selected(self):
+        """Extracts the selected file or folder from the ISO to the local filesystem."""
+        logger.info("Extract Selected action triggered.")
         node = self.get_selected_node()
         if not node:
+            logger.debug("Extract selected called with no valid node selected.")
             return
 
         if node['is_directory']:
@@ -367,42 +480,74 @@ class ISOEditor(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(self, "Save File As", node['name'])
 
         if not path:
+            logger.info("Extraction dialog cancelled.")
             return
 
         try:
             self._extract_node_recursive(node, path)
             self.update_status(f"Extracted {node['name']}")
+            logger.info(f"Successfully extracted {node['name']} to {path}")
             QMessageBox.information(self, "Success", "Extraction complete.")
         except Exception as e:
+            logger.exception(f"Failed to extract {node['name']}: {e}")
             QMessageBox.critical(self, "Error", f"Failed to extract: {e}")
 
     def _extract_node_recursive(self, node, extract_path):
-        if node['is_directory']:
-            os.makedirs(extract_path, exist_ok=True)
-            for child in node['children']:
-                child_path = os.path.join(extract_path, child['name'])
-                self._extract_node_recursive(child, child_path)
-        else:
-            file_data = self.core.get_file_data(node)
-            os.makedirs(os.path.dirname(extract_path), exist_ok=True)
-            with open(extract_path, 'wb') as f:
-                f.write(file_data)
+        """
+        Recursively extracts a node and its children.
+
+        Args:
+            node (dict): The node to extract.
+            extract_path (str): The path to extract to.
+        """
+        try:
+            if node['is_directory']:
+                os.makedirs(extract_path, exist_ok=True)
+                for child in node['children']:
+                    child_path = os.path.join(extract_path, child['name'])
+                    self._extract_node_recursive(child, child_path)
+            else:
+                file_data = self.core.get_file_data(node)
+                os.makedirs(os.path.dirname(extract_path), exist_ok=True)
+                with open(extract_path, 'wb') as f:
+                    f.write(file_data)
+        except Exception as e:
+            logger.exception(f"Error during recursive extraction of {node.get('name')}: {e}")
+            raise
 
     def handle_drop(self, urls):
+        """
+        Handles the drop event from the DroppableTreeWidget.
+
+        Args:
+            urls (list): A list of local file paths from the drop event.
+        """
+        logger.info(f"Drag and drop event received with {len(urls)} URLs.")
         target_node = self.get_selected_node() or self.core.directory_tree
         if not target_node['is_directory']:
             target_node = target_node['parent']
 
         for url in urls:
-            if os.path.isfile(url):
-                self.core.add_file_to_directory(url, target_node)
-            elif os.path.isdir(url):
-                self._import_directory_recursive(url, target_node)
+            try:
+                if os.path.isfile(url):
+                    self.core.add_file_to_directory(url, target_node)
+                elif os.path.isdir(url):
+                    self._import_directory_recursive(url, target_node)
+            except Exception as e:
+                logger.exception(f"Failed to process dropped item {url}: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to add {os.path.basename(url)}: {e}")
 
         self.refresh_view()
         self.update_status(f"Added {len(urls)} items via drag and drop.")
 
     def _import_directory_recursive(self, source_dir, target_node):
+        """
+        Recursively imports a directory and its contents.
+
+        Args:
+            source_dir (str): The source directory to import.
+            target_node (dict): The target node in the ISO to import into.
+        """
         dir_name = os.path.basename(source_dir)
         # Avoid creating a folder if one with the same name already exists.
         existing_folder = next((c for c in target_node['children'] if c['name'].lower() == dir_name.lower() and c['is_directory']), None)
@@ -414,12 +559,21 @@ class ISOEditor(QMainWindow):
 
         for item in os.listdir(source_dir):
             item_path = os.path.join(source_dir, item)
+            if os.path.islink(item_path):
+                logger.warning(f"Skipping symbolic link: {item_path}")
+                continue
             if os.path.isfile(item_path):
                 self.core.add_file_to_directory(item_path, new_dir_node)
             elif os.path.isdir(item_path):
                 self._import_directory_recursive(item_path, new_dir_node)
 
     def show_context_menu(self, position: QPoint):
+        """
+        Shows the context menu for the tree view.
+
+        Args:
+            position (QPoint): The position to show the context menu at.
+        """
         item = self.tree.itemAt(position)
         if not item:
             return
@@ -440,6 +594,8 @@ class ISOEditor(QMainWindow):
             self.remove_selected()
 
     def show_iso_properties(self):
+        """Shows the ISO properties dialog."""
+        logger.info("Show ISO Properties action triggered.")
         if not self.core.volume_descriptor:
             QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
             return
@@ -447,6 +603,7 @@ class ISOEditor(QMainWindow):
         dialog = PropertiesDialog(self, self.core.volume_descriptor, self.core.boot_image_path, self.core.efi_boot_image_path)
         if dialog.exec():
             new_props = dialog.get_properties()
+            logger.info(f"ISO properties updated: {new_props}")
 
             # Check if anything has changed to set the modified flag
             if (self.core.volume_descriptor.get('volume_id') != new_props['volume_id'] or
@@ -462,10 +619,12 @@ class ISOEditor(QMainWindow):
                 self.refresh_view()
 
     def refresh_view(self):
+        """Refreshes the tree view to show the current state of the ISO."""
+        logger.debug("Refreshing tree view.")
         self.tree.clear()
         self.tree_item_map = {}
         if self.core.directory_tree:
-            root_item = QTreeWidgetItem(self.tree, ['/', '', self.core.directory_tree['date'], 'Directory'])
+            root_item = QTreeWidgetItem(self.tree, ['/', '', self.core.directory_tree.get('date', ''), 'Directory'])
             self.tree.addTopLevelItem(root_item)
             self.tree_item_map[id(root_item)] = self.core.directory_tree
             self.populate_tree_node(root_item, self.core.directory_tree)
@@ -482,39 +641,56 @@ class ISOEditor(QMainWindow):
         self.update_status("View refreshed")
 
     def populate_tree_node(self, parent_item, parent_node):
+        """
+        Recursively populates the tree view with nodes.
+
+        Args:
+            parent_item (QTreeWidgetItem): The parent tree item.
+            parent_node (dict): The parent node in the directory tree.
+        """
         # Sort children: directories first, then files, both alphabetically
-        sorted_children = sorted(parent_node['children'], key=lambda x: (not x['is_directory'], x['name'].lower()))
+        sorted_children = sorted(parent_node.get('children', []), key=lambda x: (not x.get('is_directory', False), x.get('name', '').lower()))
 
         for child in sorted_children:
             if child.get('is_hidden') and not self.show_hidden:
                 continue
 
-            size_text = self.format_file_size(child['size']) if not child['is_directory'] else ''
-            file_type = 'Directory' if child['is_directory'] else 'File'
-            display_name = child['name']
+            size_text = self.format_file_size(child.get('size', 0)) if not child.get('is_directory') else ''
+            file_type = 'Directory' if child.get('is_directory') else 'File'
+            display_name = child.get('name', '')
             if child.get('is_new'):
                 display_name += " [NEW]"
 
-            child_item = QTreeWidgetItem(parent_item, [display_name, size_text, child['date'], file_type])
+            child_item = QTreeWidgetItem(parent_item, [display_name, size_text, child.get('date', ''), file_type])
             self.tree_item_map[id(child_item)] = child
 
-            if child['is_directory'] and child['children']:
+            if child.get('children'):
                 self.populate_tree_node(child_item, child)
 
     def update_iso_info(self):
+        """Updates the ISO information display."""
         if not self.core.volume_descriptor:
             self.iso_info.setText("No ISO loaded.")
             self.volume_name_label.setText("Volume Name: -")
             return
 
         vd = self.core.volume_descriptor
-        info_text = (f"System ID: {vd['system_id']}\n"
-                     f"Volume Size: {vd['volume_size']} blocks\n"
-                     f"Block Size: {vd['logical_block_size']} bytes")
+        info_text = (f"System ID: {vd.get('system_id', 'N/A')}\n"
+                     f"Volume Size: {vd.get('volume_size', 0)} blocks\n"
+                     f"Block Size: {vd.get('logical_block_size', 0)} bytes")
         self.iso_info.setText(info_text)
-        self.volume_name_label.setText(f"Volume Name: {vd['volume_id']}")
+        self.volume_name_label.setText(f"Volume Name: {vd.get('volume_id', 'N/A')}")
 
     def format_file_size(self, size):
+        """
+        Formats a file size in bytes into a human-readable string.
+
+        Args:
+            size (int): The file size in bytes.
+
+        Returns:
+            str: The formatted file size string.
+        """
         if size == 0: return "0 B"
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024.0: return f"{size:.1f} {unit}"
@@ -522,6 +698,12 @@ class ISOEditor(QMainWindow):
         return f"{size:.1f} TB"
 
 def main():
+    """The main entry point of the application."""
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        filename='iso_editor.log',
+                        filemode='w')
+    logger.info("Application starting...")
     app = QApplication(sys.argv)
     editor = ISOEditor()
     editor.show()
