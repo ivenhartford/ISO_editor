@@ -7,6 +7,7 @@ import math
 import logging
 import pycdlib
 from io import BytesIO
+import posixpath
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +464,7 @@ class ISOBuilder:
         logger.info("Starting ISO build process with pycdlib.")
 
         self.iso.new(
+            interchange_level=3,
             vol_ident=self.volume_id,
             joliet=3 if self.use_joliet else None,
             rock_ridge='1.09' if self.use_rock_ridge else None
@@ -483,9 +485,9 @@ class ISOBuilder:
         """
         for child in node['children']:
             child_iso_name = child['name'].upper()
-            child_iso_path = os.path.join(iso_path, child_iso_name)
+            child_iso_path = posixpath.join(iso_path, child_iso_name)
 
-            joliet_path = os.path.join(iso_path, child['name'])
+            joliet_path = posixpath.join(iso_path, child['name'])
             rr_name = child['name']
 
             if child['is_directory']:
