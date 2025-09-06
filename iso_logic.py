@@ -54,16 +54,17 @@ class ISOCore:
     def load_iso(self, file_path):
         logger.info(f"Loading ISO from path: {file_path}")
         self.close_iso()
-        self.current_iso_path = file_path
-        self.iso_file_handle = open(file_path, 'rb')
         try:
+            self.iso_file_handle = open(file_path, 'rb')
+            self.current_iso_path = file_path
             self.parse_iso_structure()
             self.iso_modified = False
-            logger.info("ISO parsing successful.")
+        except FileNotFoundError:
+            self.init_new_iso()
+            raise IOError(f"ISO file not found at path: {file_path}")
         except Exception as e:
-            logger.error(f"Failed to parse ISO structure: {e}", exc_info=True)
-            self.init_new_iso() # Reset to a clean state
-            raise
+            self.init_new_iso()
+            raise e
 
     def save_iso(self, output_path, use_joliet, use_rock_ridge):
         logger.info(f"Saving ISO to: {output_path}")
@@ -228,8 +229,11 @@ class ISOCore:
 
     def add_file_to_directory(self, file_path, target_node):
         filename = os.path.basename(file_path)
-        logger.info(f"Adding file '{filename}' to directory '{target_node['name']}'")
-        with open(file_path, 'rb') as f: file_data = f.read()
+        try:
+            with open(file_path, 'rb') as f: file_data = f.read()
+        except FileNotFoundError:
+            raise IOError(f"File not found: {file_path}")
+            
         file_stats = os.stat(file_path)
         new_node = {
             'name': filename, 'is_directory': False, 'is_hidden': False,
@@ -388,8 +392,11 @@ class ISOBuilder:
         nodes = {}
         # Handle BIOS boot image
         if self.boot_image_path and os.path.exists(self.boot_image_path):
-            with open(self.boot_image_path, 'rb') as f:
-                boot_image_data = f.read()
+            try:
+                with open(self.boot_image_path, 'rb') as f:
+                    boot_image_data = f.read()
+            except FileNotFoundError:
+                raise IOError(f"Boot image not found: {self.boot_image_path}")
             bios_node = {
                 'name': 'BOOT.IMG',
                 'is_directory': False, 'is_hidden': True, 'size': len(boot_image_data),
@@ -401,8 +408,11 @@ class ISOBuilder:
 
         # Handle EFI boot image
         if self.efi_boot_image_path and os.path.exists(self.efi_boot_image_path):
-            with open(self.efi_boot_image_path, 'rb') as f:
-                efi_boot_image_data = f.read()
+            try:
+                with open(self.efi_boot_image_path, 'rb') as f:
+                    efi_boot_image_data = f.read()
+            except FileNotFoundError:
+                raise IOError(f"EFI boot image not found: {self.efi_boot_image_path}")
             efi_node = {
                 'name': 'EFI.IMG',
                 'is_directory': False, 'is_hidden': True, 'size': len(efi_boot_image_data),
