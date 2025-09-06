@@ -1,4 +1,6 @@
 import sys
+import logging
+import logging.config
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -75,6 +77,8 @@ class PropertiesDialog(QDialog):
 class ISOEditor(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Application starting...")
         self.setWindowTitle("ISO Editor")
         self.setGeometry(100, 100, 800, 600)
         self.core = ISOCore()
@@ -201,29 +205,37 @@ class ISOEditor(QMainWindow):
     def open_iso(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open ISO", "", "ISO Files (*.iso);;All Files (*)")
         if not file_path:
+            self.logger.info("Open ISO dialog cancelled.")
             return
+        self.logger.info(f"Opening ISO file: {file_path}")
         try:
             self.core.load_iso(file_path)
             self.refresh_view()
             self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
+            self.logger.info(f"Successfully loaded ISO: {file_path}")
         except Exception as e:
+            self.logger.error(f"Failed to load ISO: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
             self.update_status("Error loading ISO")
 
     def new_iso(self):
+        self.logger.info("Creating new ISO.")
         if self.core.iso_modified:
             reply = QMessageBox.question(self, "Unsaved Changes",
                                            "Save changes before creating a new ISO?",
                                            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
             if reply == QMessageBox.Cancel:
+                self.logger.info("New ISO creation cancelled due to unsaved changes.")
                 return
             if reply == QMessageBox.Yes:
                 self.save_iso()
                 if self.core.iso_modified: # If save was cancelled
+                    self.logger.info("Save was cancelled, aborting new ISO creation.")
                     return
         self.core.init_new_iso()
         self.refresh_view()
         self.update_status("Created new empty ISO.")
+        self.logger.info("New empty ISO created.")
 
     def save_iso(self):
         if not self.core.current_iso_path:
@@ -234,16 +246,22 @@ class ISOEditor(QMainWindow):
     def save_iso_as(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
         if file_path:
+            self.logger.info(f"Saving ISO to new path: {file_path}")
             self._perform_save(file_path)
+        else:
+            self.logger.info("Save As dialog cancelled.")
 
     def _perform_save(self, file_path):
         self.update_status("Building ISO...")
+        self.logger.info(f"Performing save to: {file_path}")
         try:
             self.core.save_iso(file_path, use_joliet=True, use_rock_ridge=True)
             self.refresh_view()
             self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
             QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+            self.logger.info(f"ISO saved successfully to {file_path}")
         except Exception as e:
+            self.logger.error(f"Error saving ISO to {file_path}: {e}", exc_info=True)
             traceback.print_exc()
             QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {str(e)}")
             self.update_status("Error saving ISO.")
@@ -261,15 +279,19 @@ class ISOEditor(QMainWindow):
 
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Files")
         if not file_paths:
+            self.logger.info("Add files dialog cancelled.")
             return
 
+        self.logger.info(f"Adding {len(file_paths)} files.")
         for fp in file_paths:
             if any(c['name'].lower() == os.path.basename(fp).lower() for c in target_node['children']):
                 reply = QMessageBox.question(self, "File Exists", f"File '{os.path.basename(fp)}' already exists. Replace it?",
                                                QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.No:
+                    self.logger.info(f"Skipping existing file: {fp}")
                     continue
             self.core.add_file_to_directory(fp, target_node)
+            self.logger.info(f"Added file: {fp}")
 
         self.refresh_view()
         self.update_status(f"Added {len(file_paths)} file(s)")
@@ -281,25 +303,32 @@ class ISOEditor(QMainWindow):
 
         folder_name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
         if not ok or not folder_name:
+            self.logger.info("Add folder dialog cancelled.")
             return
 
         if any(c['name'].lower() == folder_name.lower() for c in target_node['children']):
+            self.logger.warning(f"Attempted to create a folder that already exists: {folder_name}")
             QMessageBox.critical(self, "Folder Exists", f"Folder '{folder_name}' already exists.")
             return
 
+        self.logger.info(f"Adding new folder: {folder_name}")
         self.core.add_folder_to_directory(folder_name, target_node)
         self.refresh_view()
 
     def remove_selected(self):
         node = self.get_selected_node()
         if not node or node == self.core.directory_tree:
+            self.logger.warning("Attempted to remove root or no node selected.")
             return
 
         reply = QMessageBox.question(self, "Confirm Removal", f"Are you sure you want to remove '{node['name']}'?",
                                        QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            self.logger.info(f"Removing node: {node['name']}")
             self.core.remove_node(node)
             self.refresh_view()
+        else:
+            self.logger.info(f"Removal of node cancelled: {node['name']}")
 
     def import_directory(self):
         target_node = self.get_selected_node() or self.core.directory_tree
@@ -308,7 +337,10 @@ class ISOEditor(QMainWindow):
 
         source_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Import")
         if not source_dir:
+            self.logger.info("Import directory dialog cancelled.")
             return
+
+        self.logger.info(f"Importing directory '{source_dir}'")
 
         def import_recursive(source, target):
             dir_name = os.path.basename(source)
@@ -324,10 +356,12 @@ class ISOEditor(QMainWindow):
         import_recursive(source_dir, target_node)
         self.refresh_view()
         self.update_status(f"Imported directory '{os.path.basename(source_dir)}'")
+        self.logger.info(f"Successfully imported directory '{source_dir}'")
 
     def extract_selected(self):
         node = self.get_selected_node()
         if not node:
+            self.logger.warning("Extract called with no node selected.")
             return
 
         if node['is_directory']:
@@ -338,13 +372,17 @@ class ISOEditor(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(self, "Save File As", node['name'])
 
         if not path:
+            self.logger.info("Extraction dialog cancelled.")
             return
 
+        self.logger.info(f"Extracting node '{node['name']}' to '{path}'")
         try:
             self._extract_node_recursive(node, path)
             self.update_status(f"Extracted {node['name']}")
             QMessageBox.information(self, "Success", "Extraction complete.")
+            self.logger.info(f"Successfully extracted node '{node['name']}'")
         except Exception as e:
+            self.logger.error(f"Failed to extract node '{node['name']}': {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to extract: {e}")
 
     def _extract_node_recursive(self, node, extract_path):
@@ -381,11 +419,14 @@ class ISOEditor(QMainWindow):
 
     def show_iso_properties(self):
         if not self.core.volume_descriptor:
+            self.logger.warning("Attempted to show ISO properties with no ISO loaded.")
             QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
             return
 
+        self.logger.info("Showing ISO properties dialog.")
         dialog = PropertiesDialog(self, self.core.volume_descriptor, self.core.boot_image_path, self.core.efi_boot_image_path)
         if dialog.exec():
+            self.logger.info("ISO properties dialog accepted.")
             new_props = dialog.get_properties()
 
             # Check if anything has changed to set the modified flag
@@ -394,12 +435,15 @@ class ISOEditor(QMainWindow):
                 self.core.boot_image_path != new_props['boot_image_path'] or
                 self.core.efi_boot_image_path != new_props['efi_boot_image_path']):
 
+                self.logger.info("ISO properties changed.")
                 self.core.volume_descriptor['volume_id'] = new_props['volume_id']
                 self.core.volume_descriptor['system_id'] = new_props['system_id']
                 self.core.boot_image_path = new_props['boot_image_path']
                 self.core.efi_boot_image_path = new_props['efi_boot_image_path']
                 self.core.iso_modified = True
                 self.refresh_view()
+        else:
+            self.logger.info("ISO properties dialog cancelled.")
 
     def refresh_view(self):
         self.tree.clear()
@@ -462,6 +506,12 @@ class ISOEditor(QMainWindow):
         return f"{size:.1f} TB"
 
 def main():
+    if os.path.exists('logging.conf'):
+        logging.config.fileConfig('logging.conf', disable_existing_loggers=False)
+    else:
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        logging.warning("logging.conf not found, using basic configuration.")
+
     app = QApplication(sys.argv)
     editor = ISOEditor()
     editor.show()
