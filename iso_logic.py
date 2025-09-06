@@ -5,6 +5,9 @@ import tempfile
 import shutil
 import math
 import logging
+import pycdlib
+from io import BytesIO
+import posixpath
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,7 @@ class ISOCore:
         self.is_joliet = False
         self.boot_image_path = None
         self.efi_boot_image_path = None
-        self.boot_emulation_type = 'no_emulation'
+        self.boot_emulation_type = 'noemul'
         self.init_new_iso()
 
     def init_new_iso(self):
@@ -38,7 +41,7 @@ class ISOCore:
         self.current_iso_path = None
         self.boot_image_path = None
         self.efi_boot_image_path = None
-        self.boot_emulation_type = 'no_emulation'
+        self.boot_emulation_type = 'noemul'
         self.iso_modified = False
         self.volume_descriptor = {
             'system_id': 'TK_ISO_EDITOR', 'volume_id': 'NEW_ISO',
@@ -269,17 +272,25 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': tree
             }
-            if entry['is_directory']: self.build_directory_subtree(node)
+            if entry['is_directory']: self.build_directory_subtree(node, {self.root_directory['extent_location']})
             tree['children'].append(node)
         return tree
 
-    def build_directory_subtree(self, parent_node):
+    def build_directory_subtree(self, parent_node, visited_extents=None):
         """
         Recursively builds a subtree for a given directory node.
 
         Args:
             parent_node (dict): The parent directory node to build the subtree from.
+            visited_extents (set, optional): A set of visited extent locations to prevent infinite loops.
         """
+        if visited_extents is None:
+            visited_extents = set()
+
+        if parent_node['extent_location'] in visited_extents:
+            return
+        visited_extents.add(parent_node['extent_location'])
+
         for entry in self.read_directory_entries(parent_node['extent_location']):
             if entry['file_id'] in ['.', '..']: continue
             node = {
@@ -288,8 +299,8 @@ class ISOCore:
                 'date': entry['recording_date'], 'extent_location': entry['extent_location'],
                 'children': [], 'parent': parent_node
             }
-            if entry['is_directory'] and len(parent_node['name']) < 50:
-                self.build_directory_subtree(node)
+            if entry['is_directory']:
+                self.build_directory_subtree(node, visited_extents)
             parent_node['children'].append(node)
 
     def read_directory_entries(self, extent_location):
@@ -353,6 +364,9 @@ class ISOCore:
             file_path (str): The path to the local file to add.
             target_node (dict): The target directory node in the ISO tree.
         """
+        if not target_node['is_directory']:
+            target_node = target_node['parent']
+
         logger.info(f"Adding file '{file_path}' to '{self.get_node_path(target_node)}'")
         filename = os.path.basename(file_path)
         try:
@@ -381,6 +395,12 @@ class ISOCore:
             target_node (dict): The target directory node in the ISO tree.
         """
         logger.info(f"Adding folder '{folder_name}' to '{self.get_node_path(target_node)}'")
+
+        # Check if a folder with the same name already exists
+        if any(c['name'].lower() == folder_name.lower() and c['is_directory'] for c in target_node['children']):
+            logger.warning(f"Folder '{folder_name}' already exists in '{self.get_node_path(target_node)}'")
+            return
+
         new_node = {
             'name': folder_name, 'is_directory': True, 'is_hidden': False, 'size': 0,
             'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
@@ -402,154 +422,6 @@ class ISOCore:
             parent['children'] = [c for c in parent['children'] if id(c) != id(node_to_remove)]
             self.iso_modified = True
 
-    def calculate_next_extent_location(self):
-        """Calculates the next available LBA for writing new data."""
-        max_extent = 0
-        def find_max_extent(node):
-            nonlocal max_extent
-            if node.get('extent_location', 0) > max_extent:
-                max_extent = node['extent_location']
-            for child in node.get('children', []):
-                find_max_extent(child)
-        if self.directory_tree:
-            find_max_extent(self.directory_tree)
-        self.next_extent_location = max_extent + 10
-        logger.debug(f"Calculated next available extent location: {self.next_extent_location}")
-
-class ISOBuilder:
-    """
-    Builds an ISO 9660 file from an in-memory directory tree.
-    """
-    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
-                 use_joliet=True, use_rock_ridge=True,
-                 boot_image_path=None, efi_boot_image_path=None,
-                 boot_emulation_type='no_emulation', core=None):
-        """
-        Initializes the ISOBuilder.
-
-        Args:
-            root_node (dict): The root node of the directory tree to build.
-            output_path (str): The path to write the output ISO file to.
-            volume_id (str): The volume ID for the ISO.
-            use_joliet (bool): Whether to include Joliet extensions.
-            use_rock_ridge (bool): Whether to include Rock Ridge extensions.
-            boot_image_path (str, optional): Path to the BIOS boot image.
-            efi_boot_image_path (str, optional): Path to the EFI boot image.
-            boot_emulation_type (str): The El Torito boot emulation type.
-            core (ISOCore, optional): The ISOCore instance, for accessing file data.
-        """
-        self.root_node = root_node
-        self.output_path = output_path
-        self.volume_id = volume_id
-        self.use_joliet = use_joliet
-        self.use_rock_ridge = use_rock_ridge
-        self.boot_image_path = boot_image_path
-        self.efi_boot_image_path = efi_boot_image_path
-        self.boot_emulation_type = boot_emulation_type
-        self.logical_block_size = 2048
-        self.next_lba = 0
-        self.temp_file = None
-        self.core = core
-
-    def build(self):
-        """
-        Builds the ISO file and writes it to the output path.
-        """
-        logger.info("Starting ISO build process.")
-        self.temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-        try:
-            # ... (build logic)
-            logger.info("ISO build process completed successfully.")
-        finally:
-            if self.temp_file:
-                self.temp_file.close()
-                shutil.move(self.temp_file.name, self.output_path)
-                logger.info(f"Temporary file moved to {self.output_path}")
-
-    def _add_boot_images(self):
-        """Adds boot images to the root directory if they exist."""
-        # ... (implementation)
-
-    def _write_data_at_lba(self, lba, data):
-        """Writes a block of data at a specific LBA."""
-        # ... (implementation)
-
-    def _write_data_block(self, data):
-        """
-        Writes a block of data to the next available LBA, padding it to a full sector.
-
-        Args:
-            data (bytes): The data to write.
-
-        Returns:
-            int: The LBA where the data was written.
-        """
-        lba = self.next_lba
-        num_blocks = math.ceil(len(data) / self.logical_block_size) if data else 1
-        padded_data = data.ljust(num_blocks * self.logical_block_size, b'\x00')
-        self._write_data_at_lba(lba, padded_data)
-        self.next_lba += num_blocks
-        return lba
-
-    def _get_short_name(self, name):
-        """Converts a long filename to a DOS-compatible 8.3 filename."""
-        # ... (implementation)
-
-    def _layout_hierarchy(self, is_joliet, file_map=None):
-        """
-        Lays out the file and directory hierarchy, writing file data and
-        calculating directory record sizes.
-
-        Args:
-            is_joliet (bool): True if laying out for a Joliet SVD.
-            file_map (dict, optional): A map to reuse file extents between PVD and SVD.
-
-        Returns:
-            tuple: A tuple containing the path table records and the file map.
-        """
-        # ... (implementation)
-
-    def _generate_path_tables(self, path_table_records, is_joliet):
-        """
-        Generates the little-endian and big-endian path tables.
-
-        Args:
-            path_table_records (list): A list of path table record dictionaries.
-            is_joliet (bool): True if generating for a Joliet SVD.
-
-        Returns:
-            tuple: A tuple containing the little-endian and big-endian path table data.
-        """
-        # ... (implementation)
-
-    def _write_directory_records_recursively(self, node, is_joliet):
-        """Recursively writes the directory records for a node and its children."""
-        # ... (implementation)
-
-    def _generate_directory_records_for_node(self, node, is_joliet):
-        """Generates the full directory record data for a single directory."""
-        # ... (implementation)
-
-    def _create_dir_record(self, node, is_joliet, is_self=False, is_parent=False):
-        """Creates a single directory record."""
-        # ... (implementation)
-
-    def _generate_pvd(self, volume_size, lba_l, lba_m, path_table_size, is_joliet=False, boot_catalog_lba=0):
-        """Generates a Primary or Supplementary Volume Descriptor."""
-        # ... (implementation)
-
-    def _generate_boot_record(self, boot_catalog_lba):
-        """Generates the El Torito Boot Volume Descriptor."""
-        # ... (implementation)
-
-    def _generate_boot_catalog(self, boot_entries):
-        """Generates the El Torito boot catalog."""
-        # ... (implementation)
-
-    def _generate_terminator(self):
-        """Generates a Volume Descriptor Set Terminator."""
-        # ... (implementation)
-
     def get_node_path(self, node):
         """
         Gets the full path string for a given node in the directory tree.
@@ -568,3 +440,135 @@ class ISOBuilder:
             path_parts.append(current['name'])
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts))
+
+    def calculate_next_extent_location(self):
+        """Calculates the next available LBA for writing new data."""
+        max_extent = 0
+        def find_max_extent(node):
+            nonlocal max_extent
+            if node.get('extent_location', 0) > max_extent:
+                max_extent = node['extent_location']
+            for child in node.get('children', []):
+                find_max_extent(child)
+        if self.directory_tree:
+            find_max_extent(self.directory_tree)
+        self.next_extent_location = max_extent + 10
+        logger.debug(f"Calculated next available extent location: {self.next_extent_location}")
+
+class ISOBuilder:
+    """
+    Builds an ISO 9660 file from an in-memory directory tree using pycdlib.
+    """
+    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
+                 use_joliet=True, use_rock_ridge=True,
+                 boot_image_path=None, efi_boot_image_path=None,
+                 boot_emulation_type='noemul', core=None):
+        self.root_node = root_node
+        self.output_path = output_path
+        self.volume_id = volume_id
+        self.use_joliet = use_joliet
+        self.use_rock_ridge = use_rock_ridge
+        self.boot_image_path = boot_image_path
+        self.efi_boot_image_path = efi_boot_image_path
+        self.boot_emulation_type = boot_emulation_type
+        self.core = core
+        self.iso = pycdlib.PyCdlib()
+
+    def build(self):
+        """
+        Builds the ISO file and writes it to the output path.
+        """
+        logger.info("Starting ISO build process with pycdlib.")
+
+        self.iso.new(
+            interchange_level=3,
+            vol_ident=self.volume_id,
+            joliet=3 if self.use_joliet else None,
+            rock_ridge='1.09' if self.use_rock_ridge else None
+        )
+
+        self._add_node_to_iso(self.root_node, '/')
+
+        if self.boot_image_path or self.efi_boot_image_path:
+            self._add_boot_images()
+
+        self.iso.write(self.output_path)
+        self.iso.close()
+        logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
+
+    def _get_all_nodes_flat(self, node, iso_path):
+        """
+        Walks the directory tree and returns a flat list of all nodes
+        with their full paths.
+        """
+        nodes = []
+        for child in node['children']:
+            child_iso_path = posixpath.join(iso_path, child['name'])
+            nodes.append((child_iso_path, child))
+            if child['is_directory']:
+                nodes.extend(self._get_all_nodes_flat(child, child_iso_path))
+        return nodes
+
+    def build(self):
+        """
+        Builds the ISO file and writes it to the output path.
+        """
+        logger.info("Starting ISO build process with pycdlib.")
+
+        self.iso.new(
+            interchange_level=3,
+            vol_ident=self.volume_id,
+            joliet=3 if self.use_joliet else None,
+            rock_ridge='1.09' if self.use_rock_ridge else None
+        )
+
+        # Get a flat list of all nodes and sort them by path depth
+        all_nodes = self._get_all_nodes_flat(self.root_node, '/')
+        all_nodes.sort(key=lambda x: x[0].count('/'))
+
+        for iso_path, node in all_nodes:
+            iso9660_path = posixpath.join('/', iso_path.upper())
+            rr_name = node['name']
+
+            if node['is_directory']:
+                try:
+                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                except Exception as e:
+                    if 'File already exists' not in str(e):
+                        logger.error(f"Failed to add directory {iso_path} to ISO: {e}")
+            else:
+                try:
+                    file_data = self.core.get_file_data(node)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                except Exception as e:
+                    logger.error(f"Failed to add file {iso_path} to ISO: {e}")
+
+        if self.boot_image_path or self.efi_boot_image_path:
+            self._add_boot_images()
+
+        self.iso.write(self.output_path)
+        self.iso.close()
+        logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
+
+    def _add_boot_images(self):
+        """Adds boot images to the ISO if they exist."""
+        logger.info("Adding boot images to the ISO.")
+        try:
+            self.iso.add_directory('/BOOT', rr_name='BOOT', joliet_path='/boot')
+        except pycdlib.pycdlibexception.PyCdlibInvalidInput as e:
+            if 'File already exists' not in str(e):
+                raise
+
+        if self.boot_image_path and os.path.exists(self.boot_image_path):
+            bios_boot_filename = os.path.basename(self.boot_image_path)
+            bios_iso_path = f'/BOOT/{bios_boot_filename.upper()}'
+            joliet_bios_iso_path = f'/boot/{bios_boot_filename}'
+            self.iso.add_file(self.boot_image_path, bios_iso_path, rr_name=bios_boot_filename, joliet_path=joliet_bios_iso_path)
+            self.iso.add_eltorito(bios_iso_path, media_name=self.boot_emulation_type)
+
+        if self.efi_boot_image_path and os.path.exists(self.efi_boot_image_path):
+            efi_boot_filename = os.path.basename(self.efi_boot_image_path)
+            efi_iso_path = f'/BOOT/{efi_boot_filename.upper()}'
+            joliet_efi_iso_path = f'/boot/{efi_boot_filename}'
+            self.iso.add_file(self.efi_boot_image_path, efi_iso_path, rr_name=efi_boot_filename, joliet_path=joliet_efi_iso_path)
+            self.iso.add_eltorito(efi_iso_path, efi=True)

@@ -1,0 +1,5 @@
+pytest
+PySide6
+pytest-qt
+pycdlib
+pytest-cov
