@@ -487,7 +487,26 @@ class ISOBuilder:
             rock_ridge='1.09' if self.use_rock_ridge else None
         )
 
-        self._add_node_to_iso(self.root_node, '/')
+        # Get a flat list of all nodes and sort them by path depth
+        all_nodes = self._get_all_nodes_flat(self.root_node, '/')
+        all_nodes.sort(key=lambda x: x[0].count('/'))
+
+        for iso_path, node in all_nodes:
+            iso9660_path = posixpath.join('/', iso_path.upper())
+            rr_name = node['name']
+
+            if node['is_directory']:
+                try:
+                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                except Exception as e:
+                    if 'File already exists' not in str(e):
+                        logger.error(f"Failed to add directory {iso_path} to ISO: {e}")
+            else:
+                try:
+                    file_data = self.core.get_file_data(node)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                except Exception as e:
+                    logger.error(f"Failed to add file {iso_path} to ISO: {e}")
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
@@ -495,6 +514,19 @@ class ISOBuilder:
         self.iso.write(self.output_path)
         self.iso.close()
         logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
+
+    def _get_all_nodes_flat(self, node, iso_path):
+        """
+        Walks the directory tree and returns a flat list of all nodes
+        with their full paths.
+        """
+        nodes = []
+        for child in node['children']:
+            child_iso_path = posixpath.join(iso_path, child['name'])
+            nodes.append((child_iso_path, child))
+            if child['is_directory']:
+                nodes.extend(self._get_all_nodes_flat(child, child_iso_path))
+        return nodes
 
     def _add_node_to_iso(self, node, iso_path):
         """
