@@ -499,22 +499,29 @@ class ISOBuilder:
     def _add_node_to_iso(self, node, iso_path):
         """
         Recursively adds a node (file or directory) from the internal tree to the ISO.
+        This uses a two-pass approach: first creating all directories, then adding all files.
         """
+        # First pass: create all directories
         for child in node['children']:
-            child_iso_name = child['name'].upper()
-            child_iso_path = posixpath.join(iso_path, child_iso_name)
-
-            joliet_path = posixpath.join(iso_path, child['name'])
-            rr_name = child['name']
-
             if child['is_directory']:
+                child_iso_name = child['name'].upper()
+                child_iso_path = posixpath.join(iso_path, child_iso_name)
+                joliet_path = posixpath.join(iso_path, child['name'])
+                rr_name = child['name']
                 try:
                     self.iso.add_directory(child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
                     self._add_node_to_iso(child, child_iso_path)
                 except Exception as e:
                     if 'File already exists' not in str(e):
                         logger.error(f"Failed to add directory {child_iso_path} to ISO: {e}")
-            else:
+
+        # Second pass: add all files
+        for child in node['children']:
+            if not child['is_directory']:
+                child_iso_name = child['name'].upper()
+                child_iso_path = posixpath.join(iso_path, child_iso_name)
+                joliet_path = posixpath.join(iso_path, child['name'])
+                rr_name = child['name']
                 try:
                     file_data = self.core.get_file_data(child)
                     self.iso.add_fp(BytesIO(file_data), len(file_data), child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
