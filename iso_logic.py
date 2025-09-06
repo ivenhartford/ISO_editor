@@ -413,8 +413,10 @@ class ISOBuilder:
 
     def _write_data_block(self, data):
         lba = self.next_lba
-        self._write_data_at_lba(lba, data)
-        self.next_lba += math.ceil(len(data) / self.logical_block_size) if data else 1
+        num_blocks = math.ceil(len(data) / self.logical_block_size) if data else 1
+        padded_data = data.ljust(num_blocks * self.logical_block_size, b'\x00')
+        self._write_data_at_lba(lba, padded_data)
+        self.next_lba += num_blocks
         return lba
 
     def _get_short_name(self, name):
