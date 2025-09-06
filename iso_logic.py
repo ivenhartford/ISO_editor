@@ -487,41 +487,6 @@ class ISOBuilder:
             rock_ridge='1.09' if self.use_rock_ridge else None
         )
 
-        self._add_node_to_iso(self.root_node, '/')
-
-        if self.boot_image_path or self.efi_boot_image_path:
-            self._add_boot_images()
-
-        self.iso.write(self.output_path)
-        self.iso.close()
-        logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
-
-    def _get_all_nodes_flat(self, node, iso_path):
-        """
-        Walks the directory tree and returns a flat list of all nodes
-        with their full paths.
-        """
-        nodes = []
-        for child in node['children']:
-            child_iso_path = posixpath.join(iso_path, child['name'])
-            nodes.append((child_iso_path, child))
-            if child['is_directory']:
-                nodes.extend(self._get_all_nodes_flat(child, child_iso_path))
-        return nodes
-
-    def build(self):
-        """
-        Builds the ISO file and writes it to the output path.
-        """
-        logger.info("Starting ISO build process with pycdlib.")
-
-        self.iso.new(
-            interchange_level=3,
-            vol_ident=self.volume_id,
-            joliet=3 if self.use_joliet else None,
-            rock_ridge='1.09' if self.use_rock_ridge else None
-        )
-
         # Get a flat list of all nodes and sort them by path depth
         all_nodes = self._get_all_nodes_flat(self.root_node, '/')
         all_nodes.sort(key=lambda x: x[0].count('/'))
@@ -549,6 +514,51 @@ class ISOBuilder:
         self.iso.write(self.output_path)
         self.iso.close()
         logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
+
+    def _get_all_nodes_flat(self, node, iso_path):
+        """
+        Walks the directory tree and returns a flat list of all nodes
+        with their full paths.
+        """
+        nodes = []
+        for child in node['children']:
+            child_iso_path = posixpath.join(iso_path, child['name'])
+            nodes.append((child_iso_path, child))
+            if child['is_directory']:
+                nodes.extend(self._get_all_nodes_flat(child, child_iso_path))
+        return nodes
+
+    def _add_node_to_iso(self, node, iso_path):
+        """
+        Recursively adds a node (file or directory) from the internal tree to the ISO.
+        This uses a two-pass approach: first creating all directories, then adding all files.
+        """
+        # First pass: create all directories
+        for child in node['children']:
+            if child['is_directory']:
+                child_iso_name = child['name'].upper()
+                child_iso_path = posixpath.join(iso_path, child_iso_name)
+                joliet_path = posixpath.join(iso_path, child['name'])
+                rr_name = child['name']
+                try:
+                    self.iso.add_directory(child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
+                    self._add_node_to_iso(child, child_iso_path)
+                except Exception as e:
+                    if 'File already exists' not in str(e):
+                        logger.error(f"Failed to add directory {child_iso_path} to ISO: {e}")
+
+        # Second pass: add all files
+        for child in node['children']:
+            if not child['is_directory']:
+                child_iso_name = child['name'].upper()
+                child_iso_path = posixpath.join(iso_path, child_iso_name)
+                joliet_path = posixpath.join(iso_path, child['name'])
+                rr_name = child['name']
+                try:
+                    file_data = self.core.get_file_data(child)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
+                except Exception as e:
+                    logger.error(f"Failed to add file {child_iso_path} to ISO: {e}")
 
     def _add_boot_images(self):
         """Adds boot images to the ISO if they exist."""
