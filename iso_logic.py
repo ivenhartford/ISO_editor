@@ -356,6 +356,9 @@ class ISOCore:
             file_path (str): The path to the local file to add.
             target_node (dict): The target directory node in the ISO tree.
         """
+        if not target_node['is_directory']:
+            target_node = target_node['parent']
+
         logger.info(f"Adding file '{file_path}' to '{self.get_node_path(target_node)}'")
         filename = os.path.basename(file_path)
         try:
@@ -384,6 +387,12 @@ class ISOCore:
             target_node (dict): The target directory node in the ISO tree.
         """
         logger.info(f"Adding folder '{folder_name}' to '{self.get_node_path(target_node)}'")
+
+        # Check if a folder with the same name already exists
+        if any(c['name'].lower() == folder_name.lower() and c['is_directory'] for c in target_node['children']):
+            logger.warning(f"Folder '{folder_name}' already exists in '{self.get_node_path(target_node)}'")
+            return
+
         new_node = {
             'name': folder_name, 'is_directory': True, 'is_hidden': False, 'size': 0,
             'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'extent_location': 0,
