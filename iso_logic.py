@@ -402,6 +402,25 @@ class ISOCore:
             parent['children'] = [c for c in parent['children'] if id(c) != id(node_to_remove)]
             self.iso_modified = True
 
+    def get_node_path(self, node):
+        """
+        Gets the full path string for a given node in the directory tree.
+
+        Args:
+            node (dict): The node to get the path for.
+
+        Returns:
+            str: The full path of the node.
+        """
+        if not node.get('parent') or node.get('parent') is node:
+            return '/'
+        path_parts = []
+        current = node
+        while current and current.get('parent') and current.get('parent') is not current:
+            path_parts.append(current['name'])
+            current = current['parent']
+        return '/' + '/'.join(reversed(path_parts))
+
     def calculate_next_extent_location(self):
         """Calculates the next available LBA for writing new data."""
         max_extent = 0
@@ -549,22 +568,3 @@ class ISOBuilder:
     def _generate_terminator(self):
         """Generates a Volume Descriptor Set Terminator."""
         # ... (implementation)
-
-    def get_node_path(self, node):
-        """
-        Gets the full path string for a given node in the directory tree.
-
-        Args:
-            node (dict): The node to get the path for.
-
-        Returns:
-            str: The full path of the node.
-        """
-        if not node.get('parent') or node.get('parent') is node:
-            return '/'
-        path_parts = []
-        current = node
-        while current and current.get('parent') and current.get('parent') is not current:
-            path_parts.append(current['name'])
-            current = current['parent']
-        return '/' + '/'.join(reversed(path_parts))
