@@ -9,6 +9,7 @@ import logging
 import pycdlib
 from io import BytesIO
 import posixpath
+from cueparser import CueSheet
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +25,13 @@ class ISOCore:
         """Initializes the ISOCore instance with a new, empty ISO structure."""
         self.current_iso_path = None
         self.volume_descriptor = None
-        self.root_directory = None
         self.directory_tree = None
         self.iso_modified = False
-        self.next_extent_location = 0
-        self.iso_file_handle = None
-        self.is_joliet = False
         self.boot_image_path = None
         self.efi_boot_image_path = None
         self.boot_emulation_type = 'noemul'
+        self._pycdlib_instance = None
+        self.is_joliet = False
         self.init_new_iso()
 
     def init_new_iso(self):
@@ -44,10 +43,11 @@ class ISOCore:
         self.efi_boot_image_path = None
         self.boot_emulation_type = 'noemul'
         self.iso_modified = False
+        self._pycdlib_instance = None
+        self.is_joliet = False
         self.volume_descriptor = {
             'system_id': 'TK_ISO_EDITOR', 'volume_id': 'NEW_ISO',
-            'volume_size': 0, 'logical_block_size': 2048,
-            'path_table_size': 0, 'root_dir_record': b''
+            'volume_size': 0, 'logical_block_size': 2048
         }
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.directory_tree = {
@@ -56,46 +56,208 @@ class ISOCore:
             'children': [], 'parent': None
         }
         self.directory_tree['parent'] = self.directory_tree
-        self.root_directory = self.directory_tree
 
     def close_iso(self):
         """Closes the currently open ISO file handle, if one exists."""
-        if self.iso_file_handle:
+        if self._pycdlib_instance:
             logger.info(f"Closing ISO file: {self.current_iso_path}")
             try:
-                self.iso_file_handle.close()
-            except IOError as e:
-                logger.error(f"Error closing ISO file: {e}")
-            self.iso_file_handle = None
+                self._pycdlib_instance.close()
+            except Exception as e:
+                logger.error(f"Error closing pycdlib instance: {e}")
+            self._pycdlib_instance = None
 
     def load_iso(self, file_path):
         """
-        Loads an ISO file from the given path and parses its structure.
+        Loads an ISO file from the given path and parses its structure using pycdlib.
 
         Args:
             file_path (str): The path to the ISO file to load.
 
         Raises:
             IOError: If the file is not found or another I/O error occurs.
-            ValueError: If the ISO structure is invalid or cannot be parsed.
+            ValueError: If the image structure is invalid or cannot be parsed.
         """
-        logger.info(f"Loading ISO from path: {file_path}")
-        self.close_iso()
-        try:
-            self.iso_file_handle = open(file_path, 'rb')
-            self.current_iso_path = file_path
-            self.parse_iso_structure()
-            self.iso_modified = False
-        except FileNotFoundError:
-            self.init_new_iso()
-            logger.error(f"ISO file not found at path: {file_path}")
-            raise IOError(f"ISO file not found at path: {file_path}")
-        except Exception as e:
-            self.init_new_iso()
-            logger.exception(f"An unexpected error occurred while loading the ISO: {e}")
-            raise
+        logger.info(f"Loading image from path: {file_path}")
+        self.init_new_iso()
 
-    def save_iso(self, output_path, use_joliet, use_rock_ridge):
+        _, extension = os.path.splitext(file_path)
+        if extension.lower() == '.cue':
+            try:
+                self._load_cue_sheet(file_path)
+                self.current_iso_path = file_path
+                self.iso_modified = False
+            except Exception as e:
+                self.init_new_iso()
+                logger.exception(f"An unexpected error occurred while loading the CUE sheet: {e}")
+                raise ValueError(f"Failed to parse CUE sheet: {e}") from e
+        else:
+            try:
+                iso = pycdlib.PyCdlib()
+                iso.open(file_path)
+
+                self._pycdlib_instance = iso
+                self.current_iso_path = file_path
+                self.is_joliet = iso.has_joliet()
+
+                if self.is_joliet and iso.joliet_vd:
+                    self.volume_descriptor['volume_id'] = iso.joliet_vd.volume_identifier.decode('utf-16-be', 'ignore').strip()
+                    self.volume_descriptor['system_id'] = iso.joliet_vd.system_identifier.decode('utf-16-be', 'ignore').strip()
+                elif iso.pvd:
+                    self.volume_descriptor['volume_id'] = iso.pvd.volume_identifier.decode('ascii', 'ignore').strip()
+                    self.volume_descriptor['system_id'] = iso.pvd.system_identifier.decode('ascii', 'ignore').strip()
+
+                self.directory_tree = self._build_tree_from_pycdlib()
+                self.iso_modified = False
+            except FileNotFoundError:
+                self.init_new_iso()
+                logger.error(f"ISO file not found at path: {file_path}")
+                raise IOError(f"ISO file not found at path: {file_path}")
+            except Exception as e:
+                self.init_new_iso()
+                logger.exception(f"An unexpected error occurred while loading the ISO with pycdlib: {e}")
+                raise ValueError(f"Failed to parse ISO with pycdlib: {e}") from e
+
+    def _load_cue_sheet(self, file_path):
+        """Builds the internal directory_tree from a CUE sheet."""
+        with open(file_path, 'r') as f:
+            cue_sheet = CueSheet()
+            cue_sheet.setOutputFormat('%performer% - %title%', '%performer% - %title%')
+            cue_sheet.setData(f.read())
+            cue_sheet.parse()
+
+        self.volume_descriptor['volume_id'] = cue_sheet.title or "CUE_SHEET"
+
+        bin_filename = cue_sheet.file
+        if not bin_filename:
+            raise ValueError("CUE sheet does not specify a BIN file.")
+
+        for i, track in enumerate(cue_sheet.tracks):
+            track_node = {
+                'name': track.title or f'TRACK_{i+1:02d}.wav',
+                'is_directory': False,
+                'is_hidden': False,
+                'size': 0, # Will be calculated later
+                'date': '',
+                'children': [],
+                'parent': self.directory_tree,
+                'is_new': False,
+                'is_cue_track': True,
+                'cue_track_number': i,
+                'cue_bin_file': os.path.join(os.path.dirname(file_path), bin_filename),
+                'cue_offset': self._parse_cue_offset(track.offset),
+            }
+            self.directory_tree['children'].append(track_node)
+
+        # Now, calculate the size of each track
+        for i, track_node in enumerate(self.directory_tree['children']):
+            if i + 1 < len(self.directory_tree['children']):
+                next_track_node = self.directory_tree['children'][i+1]
+                track_node['size'] = next_track_node['cue_offset'] - track_node['cue_offset']
+            else:
+                # For the last track, the size is the rest of the BIN file.
+                bin_path = track_node['cue_bin_file']
+                if os.path.exists(bin_path):
+                    total_size = os.path.getsize(bin_path)
+                    track_node['size'] = total_size - track_node['cue_offset']
+                else:
+                    track_node['size'] = 0
+
+    def _parse_cue_offset(self, offset_str):
+        """Converts a CUE sheet offset string (MM:SS:FF) to bytes."""
+        parts = offset_str.split(':')
+        minutes = int(parts[0])
+        seconds = int(parts[1])
+        frames = int(parts[2])
+        total_frames = (minutes * 60 * 75) + (seconds * 75) + frames
+        return total_frames * 2352 # 2352 bytes per frame for CD-DA
+
+    def _build_tree_from_pycdlib(self):
+        """Builds the internal directory_tree structure from the loaded pycdlib instance."""
+        if not self._pycdlib_instance:
+            return None
+
+        root_node = {
+            'name': '/', 'is_directory': True, 'is_hidden': False, 'size': 0,
+            'date': '', 'children': [], 'parent': None, 'iso_path': '/'
+        }
+        root_node['parent'] = root_node
+        node_map = {'/': root_node}
+
+        if self._pycdlib_instance.has_udf():
+            walk_key = 'udf_path'
+            walker = self._pycdlib_instance.walk(udf_path='/')
+        elif self.is_joliet:
+            walk_key = 'joliet_path'
+            walker = self._pycdlib_instance.walk(joliet_path='/')
+        elif self._pycdlib_instance.has_rock_ridge():
+            walk_key = 'rr_path'
+            walker = self._pycdlib_instance.walk(rr_path='/')
+        else:
+            walk_key = 'iso_path'
+            walker = self._pycdlib_instance.walk(iso_path='/')
+
+        for root, dirs, files in walker:
+            parent_node = node_map.get(root)
+            if not parent_node:
+                logger.warning(f"Could not find parent node for path: {root}")
+                continue
+
+            for item_name in dirs + files:
+                is_directory = item_name in dirs
+                item_path = posixpath.join(root, item_name)
+
+                try:
+                    record = self._pycdlib_instance.get_record(**{walk_key: item_path})
+                    if not record:
+                        logger.warning(f"Could not retrieve record for path: {item_path}")
+                        continue
+                except Exception as e:
+                    logger.error(f"Error retrieving record for {item_path}: {e}")
+                    continue
+
+                is_hidden = False
+                if walk_key != 'udf_path':
+                    is_hidden = (record.file_flags & 1) != 0
+
+                data_length = 0
+                if walk_key == 'udf_path':
+                    data_length = record.get_data_length()
+                else:
+                    data_length = record.data_length
+
+                date_obj = None
+                if walk_key == 'udf_path':
+                    date_obj = record.mod_time
+                else:
+                    date_obj = record.date
+
+                new_node = {
+                    'name': item_name,
+                    'is_directory': is_directory,
+                    'is_hidden': is_hidden,
+                    'size': data_length,
+                    'date': self._format_pycdlib_date(date_obj),
+                    'children': [],
+                    'parent': parent_node,
+                    'iso_path': item_path,
+                    'is_new': False
+                }
+                parent_node['children'].append(new_node)
+
+                if is_directory:
+                    node_map[item_path] = new_node
+        return root_node
+
+    def _format_pycdlib_date(self, pycdlib_date):
+        """Formats a pycdlib date dictionary into a string."""
+        try:
+            return (f"{pycdlib_date['year']:04d}-{pycdlib_date['month']:02d}-{pycdlib_date['day']:02d} "
+                    f"{pycdlib_date['hour']:02d}:{pycdlib_date['minute']:02d}:{pycdlib_date['second']:02d}")
+        except (TypeError, KeyError):
+            return "Unknown"
+
+    def save_iso(self, output_path, use_joliet, use_rock_ridge, progress_callback=None, make_hybrid=False, use_udf=True):
         """
         Saves the current in-memory ISO structure to a new file.
 
@@ -103,6 +265,9 @@ class ISOCore:
             output_path (str): The path to save the new ISO file to.
             use_joliet (bool): Whether to use Joliet extensions for long filenames.
             use_rock_ridge (bool): Whether to use Rock Ridge extensions.
+            progress_callback (function): A callback for progress updates.
+            make_hybrid (bool): Whether to make the ISO a hybrid ISO.
+            use_udf (bool): Whether to use UDF.
         """
         logger.info(f"Saving ISO to path: {output_path}")
         try:
@@ -115,7 +280,10 @@ class ISOCore:
                 boot_image_path=self.boot_image_path,
                 efi_boot_image_path=self.efi_boot_image_path,
                 boot_emulation_type=self.boot_emulation_type,
-                core=self
+                core=self,
+                progress_callback=progress_callback,
+                make_hybrid=make_hybrid,
+                use_udf=use_udf
             )
             builder.build()
             self.current_iso_path = output_path
@@ -123,219 +291,6 @@ class ISOCore:
         except Exception as e:
             logger.exception(f"Failed to save ISO to {output_path}: {e}")
             raise
-
-    def parse_iso_structure(self):
-        """
-        Parses the volume descriptors and file system of the loaded ISO.
-
-        Raises:
-            ValueError: If no valid Primary Volume Descriptor is found.
-        """
-        logger.debug("Starting to parse ISO structure.")
-        try:
-            pvd, joliet_svd = None, None
-            self.is_joliet = False
-            lba = 16
-            while True:
-                offset = lba * 2048
-                self.iso_file_handle.seek(offset)
-                vd = self.iso_file_handle.read(2048)
-                if len(vd) < 2048: break
-                if vd[1:6] != b'CD001': break
-                vd_type = vd[0]
-                if vd_type == 1: pvd = vd
-                elif vd_type == 2:
-                    if b'%/@' in vd[88:120] or b'%/C' in vd[88:120] or b'%/E' in vd[88:120]:
-                        joliet_svd = vd
-                elif vd_type == 255: break
-                lba += 1
-
-            pvd_data = joliet_svd if joliet_svd else pvd
-            if not pvd_data: raise ValueError("No valid Volume Descriptor found.")
-
-            self.is_joliet = joliet_svd is not None
-            id_encoding = 'utf-16-be' if self.is_joliet else 'ascii'
-            logger.info(f"ISO uses Joliet extensions: {self.is_joliet}")
-
-            self.volume_descriptor = {
-                'system_id': pvd_data[8:40].decode(id_encoding, 'ignore').strip('\x00'),
-                'volume_id': pvd_data[40:72].decode(id_encoding, 'ignore').strip('\x00'),
-                'volume_size': struct.unpack('<L', pvd_data[80:84])[0],
-                'logical_block_size': struct.unpack('<H', pvd_data[128:130])[0],
-                'path_table_size': struct.unpack('<L', pvd_data[132:136])[0],
-                'root_dir_record': pvd_data[156:190]
-            }
-            self.root_directory = self.parse_directory_record(self.volume_descriptor['root_dir_record'])
-            self.directory_tree = self.build_directory_tree()
-            self.calculate_next_extent_location()
-            logger.debug("Finished parsing ISO structure.")
-        except struct.error as e:
-            logger.exception(f"Struct error while parsing ISO structure: {e}")
-            raise ValueError("Invalid ISO structure.") from e
-        except Exception as e:
-            logger.exception(f"An unexpected error occurred during ISO parsing: {e}")
-            raise
-
-    def parse_directory_record(self, record_data):
-        """
-        Parses a single directory record.
-
-        Args:
-            record_data (bytes): The raw byte data of the directory record.
-
-        Returns:
-            dict or None: A dictionary representing the directory record,
-                          or None if the record is empty or invalid.
-        """
-        try:
-            if len(record_data) < 33: return None
-            record_length = record_data[0]
-            if record_length == 0: return None
-
-            file_id_length = record_data[32]
-            file_id_bytes = record_data[33:33 + file_id_length]
-
-            system_use_offset = 33 + file_id_length + (1 if file_id_length % 2 == 0 else 0)
-            rr_entries = self._parse_susp_entries(record_data[system_use_offset:])
-
-            if self.is_joliet:
-                if file_id_bytes == b'\x00': file_id = '.'
-                elif file_id_bytes == b'\x01': file_id = '..'
-                else: file_id = file_id_bytes.decode('utf-16-be', 'ignore')
-            else:
-                file_id = file_id_bytes.decode('ascii', 'ignore')
-
-            if 'name' in rr_entries: file_id = rr_entries['name']
-
-            recording_date = record_data[18:25]
-            date_str = "Unknown"
-            if recording_date[0] > 0:
-                try:
-                    date_str = f"{recording_date[0]+1900:04d}-{recording_date[1]:02d}-{recording_date[2]:02d} {recording_date[3]:02d}:{recording_date[4]:02d}:{recording_date[5]:02d}"
-                except: pass
-
-            return {
-                'extent_location': struct.unpack('<L', record_data[2:6])[0],
-                'data_length': struct.unpack('<L', record_data[10:14])[0],
-                'is_directory': bool(record_data[25] & 0x02),
-                'is_hidden': bool(record_data[25] & 0x01),
-                'file_id': file_id, 'record_length': record_length,
-                'recording_date': date_str, 'raw_data': record_data
-            }
-        except (struct.error, IndexError) as e:
-            logger.error(f"Failed to parse directory record: {e}")
-            return None
-
-    def _parse_susp_entries(self, system_use_data):
-        """
-        Parses System Use Sharing Protocol (SUSP) and Rock Ridge entries.
-
-        Args:
-            system_use_data (bytes): The system use area from a directory record.
-
-        Returns:
-            dict: A dictionary of parsed Rock Ridge entries (e.g., 'name').
-        """
-        entries = {}
-        i = 0
-        while i < len(system_use_data) - 4:
-            try:
-                signature, length = system_use_data[i:i+2], system_use_data[i+2]
-                if length == 0: break
-                data = system_use_data[i+4:i+length]
-                if signature == b'NM': entries['name'] = data.decode('ascii', 'ignore')
-                i += length
-            except Exception as e:
-                logger.error(f"Error parsing SUSP entries: {e}")
-                break
-        return entries
-
-    def build_directory_tree(self):
-        """
-        Builds the in-memory directory tree from the parsed root directory.
-
-        Returns:
-            dict: The root node of the constructed directory tree.
-        """
-        logger.debug("Building directory tree from parsed records.")
-        if not self.root_directory: return {}
-        tree = {
-            'name': '/', 'is_directory': True, 'children': [], 'parent': None,
-            'extent_location': self.root_directory.get('extent_location', 0),
-            'date': self.root_directory.get('recording_date', '')
-        }
-        tree['parent'] = tree
-        for entry in self.read_directory_entries(self.root_directory['extent_location']):
-            if entry['file_id'] in ['.', '..']: continue
-            node = {
-                'name': entry['file_id'], 'is_directory': entry['is_directory'],
-                'is_hidden': entry['is_hidden'], 'size': entry['data_length'],
-                'date': entry['recording_date'], 'extent_location': entry['extent_location'],
-                'children': [], 'parent': tree
-            }
-            if entry['is_directory']: self.build_directory_subtree(node, {self.root_directory['extent_location']})
-            tree['children'].append(node)
-        return tree
-
-    def build_directory_subtree(self, parent_node, visited_extents=None):
-        """
-        Recursively builds a subtree for a given directory node.
-
-        Args:
-            parent_node (dict): The parent directory node to build the subtree from.
-            visited_extents (set, optional): A set of visited extent locations to prevent infinite loops.
-        """
-        if visited_extents is None:
-            visited_extents = set()
-
-        if parent_node['extent_location'] in visited_extents:
-            return
-        visited_extents.add(parent_node['extent_location'])
-
-        for entry in self.read_directory_entries(parent_node['extent_location']):
-            if entry['file_id'] in ['.', '..']: continue
-            node = {
-                'name': entry['file_id'], 'is_directory': entry['is_directory'],
-                'is_hidden': entry['is_hidden'], 'size': entry['data_length'],
-                'date': entry['recording_date'], 'extent_location': entry['extent_location'],
-                'children': [], 'parent': parent_node
-            }
-            if entry['is_directory']:
-                self.build_directory_subtree(node, visited_extents)
-            parent_node['children'].append(node)
-
-    def read_directory_entries(self, extent_location):
-        """
-        Reads all directory entries from a given extent.
-
-        Args:
-            extent_location (int): The LBA of the extent containing the directory records.
-
-        Returns:
-            list: A list of directory record dictionaries.
-        """
-        entries = []
-        if not self.iso_file_handle: return entries
-        offset = extent_location * self.volume_descriptor['logical_block_size']
-        try:
-            self.iso_file_handle.seek(offset)
-            directory_data = self.iso_file_handle.read(self.volume_descriptor['logical_block_size'])
-        except (IOError, ValueError) as e:
-            logger.error(f"Error reading directory entries at LBA {extent_location}: {e}")
-            return entries
-
-        pos = 0
-        while pos < len(directory_data):
-            try:
-                record_length = directory_data[pos]
-                if record_length == 0: break
-                entry = self.parse_directory_record(directory_data[pos:pos + record_length])
-                if entry: entries.append(entry)
-                pos += record_length
-            except IndexError:
-                logger.error("Reached end of directory data unexpectedly.")
-                break
-        return entries
 
     def get_file_data(self, node):
         """
@@ -347,14 +302,39 @@ class ISOCore:
         Returns:
             bytes: The file data.
         """
-        if node.get('is_new'): return node.get('file_data', b'')
-        if not self.iso_file_handle: return b''
+        if node.get('is_new'):
+            return node.get('file_data', b'')
+
+        if node.get('is_cue_track'):
+            bin_path = node['cue_bin_file']
+            offset = node['cue_offset']
+            size = node['size']
+            if os.path.exists(bin_path):
+                with open(bin_path, 'rb') as f:
+                    f.seek(offset)
+                    return f.read(size)
+            else:
+                logger.warning(f"BIN file not found: {bin_path}")
+                return b''
+
+        if not self._pycdlib_instance:
+            logger.warning("get_file_data called for ISO node but no pycdlib instance is available.")
+            return b''
+
+        if self._pycdlib_instance.has_udf():
+            iso_path_key = 'udf_path'
+        elif self.is_joliet:
+            iso_path_key = 'joliet_path'
+        elif self._pycdlib_instance.has_rock_ridge():
+            iso_path_key = 'rr_path'
+        else:
+            iso_path_key = 'iso_path'
+
         try:
-            offset = node['extent_location'] * self.volume_descriptor['logical_block_size']
-            self.iso_file_handle.seek(offset)
-            return self.iso_file_handle.read(node['size'])
-        except (IOError, ValueError) as e:
-            logger.error(f"Error getting file data for {node.get('name')}: {e}")
+            with self._pycdlib_instance.open_file_from_iso(**{iso_path_key: node['iso_path']}) as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"Error getting file data for {node.get('name')} using pycdlib: {e}")
             return b''
 
     def add_file_to_directory(self, file_path, target_node):
@@ -397,7 +377,6 @@ class ISOCore:
         """
         logger.info(f"Adding folder '{folder_name}' to '{self.get_node_path(target_node)}'")
 
-        # Check if a folder with the same name already exists
         if any(c['name'].lower() == folder_name.lower() and c['is_directory'] for c in target_node['children']):
             logger.warning(f"Folder '{folder_name}' already exists in '{self.get_node_path(target_node)}'")
             return
@@ -433,14 +412,14 @@ class ISOCore:
         Returns:
             str: The full path of the node.
         """
-        if not node.get('parent') or node.get('parent') is node:
+        if not node or not node.get('parent') or node.get('parent') is node:
             return '/'
         path_parts = []
         current = node
         while current and current.get('parent') and current.get('parent') is not current:
             path_parts.append(current['name'])
             current = current['parent']
-        return '/' + '/'.join(reversed(path_parts))
+        return '/' + '/'.join(reversed(path_parts)).replace('//', '/')
 
     def find_non_compliant_filenames(self):
         """
@@ -455,15 +434,12 @@ class ISOCore:
 
         def check_node(node):
             if node['name'] != '/':
-                # ISO9660 does not allow more than one dot.
                 if node['name'].count('.') > 1:
                     non_compliant_files.append(node['name'])
 
                 base, ext = os.path.splitext(node['name'])
-                if ext:
-                    ext = ext[1:] # remove leading dot
+                if ext: ext = ext[1:]
 
-                # Check for invalid characters in the base filename and extension
                 if not iso9660_pattern.match(base.upper()) or \
                    (ext and not iso9660_pattern.match(ext.upper())):
                     non_compliant_files.append(node['name'])
@@ -476,20 +452,6 @@ class ISOCore:
 
         return list(set(non_compliant_files))
 
-    def calculate_next_extent_location(self):
-        """Calculates the next available LBA for writing new data."""
-        max_extent = 0
-        def find_max_extent(node):
-            nonlocal max_extent
-            if node.get('extent_location', 0) > max_extent:
-                max_extent = node['extent_location']
-            for child in node.get('children', []):
-                find_max_extent(child)
-        if self.directory_tree:
-            find_max_extent(self.directory_tree)
-        self.next_extent_location = max_extent + 10
-        logger.debug(f"Calculated next available extent location: {self.next_extent_location}")
-
 class ISOBuilder:
     """
     Builds an ISO 9660 file from an in-memory directory tree using pycdlib.
@@ -497,7 +459,7 @@ class ISOBuilder:
     def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
                  use_joliet=True, use_rock_ridge=True,
                  boot_image_path=None, efi_boot_image_path=None,
-                 boot_emulation_type='noemul', core=None):
+                 boot_emulation_type='noemul', core=None, progress_callback=None, make_hybrid=False, use_udf=True):
         self.root_node = root_node
         self.output_path = output_path
         self.volume_id = volume_id
@@ -507,6 +469,9 @@ class ISOBuilder:
         self.efi_boot_image_path = efi_boot_image_path
         self.boot_emulation_type = boot_emulation_type
         self.core = core
+        self.progress_callback = progress_callback
+        self.make_hybrid = make_hybrid
+        self.use_udf = use_udf
         self.iso = pycdlib.PyCdlib()
 
     def build(self):
@@ -515,101 +480,70 @@ class ISOBuilder:
         """
         logger.info("Starting ISO build process with pycdlib.")
 
+        udf_version = '2.60' if self.use_udf else None
         self.iso.new(
             interchange_level=3,
             vol_ident=self.volume_id,
             joliet=3 if self.use_joliet else None,
-            rock_ridge='1.09' if self.use_rock_ridge else None
+            rock_ridge='1.09' if self.use_rock_ridge else None,
+            udf=udf_version
         )
 
-        # Get a flat list of all nodes and sort them by path depth
-        all_nodes = self._get_all_nodes_flat(self.root_node, '/', '/')
+        all_nodes = self._get_all_nodes_flat(self.root_node, '/', '/', '/')
         all_nodes.sort(key=lambda x: x[0].count('/'))
 
-        for joliet_path, iso9660_path, node in all_nodes:
+        for joliet_path, iso9660_path, udf_path, node in all_nodes:
             rr_name = node['name']
-
             if node['is_directory']:
                 try:
-                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=joliet_path)
+                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=joliet_path, udf_path=udf_path)
                 except Exception as e:
                     if 'File already exists' not in str(e):
                         logger.error(f"Failed to add directory {joliet_path} to ISO: {e}")
             else:
                 try:
                     file_data = self.core.get_file_data(node)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=joliet_path)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=joliet_path, udf_path=udf_path)
                 except Exception as e:
                     logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
+            if self.make_hybrid:
+                self.iso.add_isohybrid()
 
-        self.iso.write(self.output_path)
+        self.iso.write(self.output_path, progress_cb=self.progress_callback)
         self.iso.close()
         logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
 
     def _sanitize_iso9660_name(self, name):
         """
         Sanitizes a filename to be compliant with the basic ISO9660 standard.
-        Level 1: A-Z, 0-9, _
         """
-        # Replace invalid characters with an underscore
-        sanitized = re.sub(r'[^A-Z0-9_]', '_', name.upper())
-        # Ensure the name is not empty
-        if not sanitized:
-            sanitized = '_'
-        # ISO9660 has length limits, but pycdlib handles this.
-        return sanitized
+        base, ext = os.path.splitext(name)
+        sanitized_base = re.sub(r'[^A-Z0-9_]', '_', base.upper())
+        if not sanitized_base: sanitized_base = '_'
+        if ext:
+            sanitized_ext = re.sub(r'[^A-Z0-9_]', '_', ext[1:].upper())
+            return f"{sanitized_base[:8]}.{sanitized_ext[:3]}"
+        return sanitized_base[:8]
 
-    def _get_all_nodes_flat(self, node, joliet_path, iso9660_path):
+    def _get_all_nodes_flat(self, node, joliet_path, iso9660_path, udf_path):
         """
         Walks the directory tree and returns a flat list of all nodes
-        with their full Joliet and ISO9660 paths.
+        with their full Joliet, ISO9660, and UDF paths.
         """
         nodes = []
         for child in node['children']:
             child_joliet_path = posixpath.join(joliet_path, child['name'])
-
+            child_udf_path = posixpath.join(udf_path, child['name'])
             sanitized_name = self._sanitize_iso9660_name(child['name'])
             child_iso9660_path = posixpath.join(iso9660_path, sanitized_name)
 
-            nodes.append((child_joliet_path, child_iso9660_path, child))
+            nodes.append((child_joliet_path, child_iso9660_path, child_udf_path, child))
             if child['is_directory']:
-                nodes.extend(self._get_all_nodes_flat(child, child_joliet_path, child_iso9660_path))
+                nodes.extend(self._get_all_nodes_flat(child, child_joliet_path, child_iso9660_path, child_udf_path))
         return nodes
-
-    def _add_node_to_iso(self, node, iso_path):
-        """
-        Recursively adds a node (file or directory) from the internal tree to the ISO.
-        This uses a two-pass approach: first creating all directories, then adding all files.
-        """
-        # First pass: create all directories
-        for child in node['children']:
-            if child['is_directory']:
-                child_iso_name = child['name'].upper()
-                child_iso_path = posixpath.join(iso_path, child_iso_name)
-                joliet_path = posixpath.join(iso_path, child['name'])
-                rr_name = child['name']
-                try:
-                    self.iso.add_directory(child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
-                    self._add_node_to_iso(child, child_iso_path)
-                except Exception as e:
-                    if 'File already exists' not in str(e):
-                        logger.error(f"Failed to add directory {child_iso_path} to ISO: {e}")
-
-        # Second pass: add all files
-        for child in node['children']:
-            if not child['is_directory']:
-                child_iso_name = child['name'].upper()
-                child_iso_path = posixpath.join(iso_path, child_iso_name)
-                joliet_path = posixpath.join(iso_path, child['name'])
-                rr_name = child['name']
-                try:
-                    file_data = self.core.get_file_data(child)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), child_iso_path, rr_name=rr_name, joliet_path=joliet_path)
-                except Exception as e:
-                    logger.error(f"Failed to add file {child_iso_path} to ISO: {e}")
 
     def _add_boot_images(self):
         """Adds boot images to the ISO if they exist."""
@@ -617,19 +551,18 @@ class ISOBuilder:
         try:
             self.iso.add_directory('/BOOT', rr_name='BOOT', joliet_path='/boot')
         except pycdlib.pycdlibexception.PyCdlibInvalidInput as e:
-            if 'File already exists' not in str(e):
-                raise
+            if 'File already exists' not in str(e): raise
 
         if self.boot_image_path and os.path.exists(self.boot_image_path):
             bios_boot_filename = os.path.basename(self.boot_image_path)
-            bios_iso_path = f'/BOOT/{bios_boot_filename.upper()}'
+            bios_iso_path = f'/BOOT/{self._sanitize_iso9660_name(bios_boot_filename)}'
             joliet_bios_iso_path = f'/boot/{bios_boot_filename}'
             self.iso.add_file(self.boot_image_path, bios_iso_path, rr_name=bios_boot_filename, joliet_path=joliet_bios_iso_path)
             self.iso.add_eltorito(bios_iso_path, media_name=self.boot_emulation_type)
 
         if self.efi_boot_image_path and os.path.exists(self.efi_boot_image_path):
             efi_boot_filename = os.path.basename(self.efi_boot_image_path)
-            efi_iso_path = f'/BOOT/{efi_boot_filename.upper()}'
+            efi_iso_path = f'/BOOT/{self._sanitize_iso9660_name(efi_boot_filename)}'
             joliet_efi_iso_path = f'/boot/{efi_boot_filename}'
             self.iso.add_file(self.efi_boot_image_path, efi_iso_path, rr_name=efi_boot_filename, joliet_path=joliet_efi_iso_path)
             self.iso.add_eltorito(efi_iso_path, efi=True)
