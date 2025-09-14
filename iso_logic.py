@@ -1,4 +1,5 @@
 import os
+import re
 import struct
 from datetime import datetime
 import tempfile
@@ -441,6 +442,40 @@ class ISOCore:
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts))
 
+    def find_non_compliant_filenames(self):
+        """
+        Scans the directory tree for filenames that do not comply with the
+        strict ISO9660 Level 1 standard.
+
+        Returns:
+            list: A list of non-compliant filenames.
+        """
+        non_compliant_files = []
+        iso9660_pattern = re.compile(r'^[A-Z0-9_]+$')
+
+        def check_node(node):
+            if node['name'] != '/':
+                # ISO9660 does not allow more than one dot.
+                if node['name'].count('.') > 1:
+                    non_compliant_files.append(node['name'])
+
+                base, ext = os.path.splitext(node['name'])
+                if ext:
+                    ext = ext[1:] # remove leading dot
+
+                # Check for invalid characters in the base filename and extension
+                if not iso9660_pattern.match(base.upper()) or \
+                   (ext and not iso9660_pattern.match(ext.upper())):
+                    non_compliant_files.append(node['name'])
+
+            for child in node.get('children', []):
+                check_node(child)
+
+        if self.directory_tree:
+            check_node(self.directory_tree)
+
+        return list(set(non_compliant_files))
+
     def calculate_next_extent_location(self):
         """Calculates the next available LBA for writing new data."""
         max_extent = 0
@@ -488,25 +523,24 @@ class ISOBuilder:
         )
 
         # Get a flat list of all nodes and sort them by path depth
-        all_nodes = self._get_all_nodes_flat(self.root_node, '/')
+        all_nodes = self._get_all_nodes_flat(self.root_node, '/', '/')
         all_nodes.sort(key=lambda x: x[0].count('/'))
 
-        for iso_path, node in all_nodes:
-            iso9660_path = posixpath.join('/', iso_path.upper())
+        for joliet_path, iso9660_path, node in all_nodes:
             rr_name = node['name']
 
             if node['is_directory']:
                 try:
-                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=joliet_path)
                 except Exception as e:
                     if 'File already exists' not in str(e):
-                        logger.error(f"Failed to add directory {iso_path} to ISO: {e}")
+                        logger.error(f"Failed to add directory {joliet_path} to ISO: {e}")
             else:
                 try:
                     file_data = self.core.get_file_data(node)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=iso_path)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=joliet_path)
                 except Exception as e:
-                    logger.error(f"Failed to add file {iso_path} to ISO: {e}")
+                    logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
@@ -515,17 +549,34 @@ class ISOBuilder:
         self.iso.close()
         logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
 
-    def _get_all_nodes_flat(self, node, iso_path):
+    def _sanitize_iso9660_name(self, name):
+        """
+        Sanitizes a filename to be compliant with the basic ISO9660 standard.
+        Level 1: A-Z, 0-9, _
+        """
+        # Replace invalid characters with an underscore
+        sanitized = re.sub(r'[^A-Z0-9_]', '_', name.upper())
+        # Ensure the name is not empty
+        if not sanitized:
+            sanitized = '_'
+        # ISO9660 has length limits, but pycdlib handles this.
+        return sanitized
+
+    def _get_all_nodes_flat(self, node, joliet_path, iso9660_path):
         """
         Walks the directory tree and returns a flat list of all nodes
-        with their full paths.
+        with their full Joliet and ISO9660 paths.
         """
         nodes = []
         for child in node['children']:
-            child_iso_path = posixpath.join(iso_path, child['name'])
-            nodes.append((child_iso_path, child))
+            child_joliet_path = posixpath.join(joliet_path, child['name'])
+
+            sanitized_name = self._sanitize_iso9660_name(child['name'])
+            child_iso9660_path = posixpath.join(iso9660_path, sanitized_name)
+
+            nodes.append((child_joliet_path, child_iso9660_path, child))
             if child['is_directory']:
-                nodes.extend(self._get_all_nodes_flat(child, child_iso_path))
+                nodes.extend(self._get_all_nodes_flat(child, child_joliet_path, child_iso9660_path))
         return nodes
 
     def _add_node_to_iso(self, node, iso_path):

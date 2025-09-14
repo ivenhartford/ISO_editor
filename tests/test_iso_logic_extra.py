@@ -1,6 +1,7 @@
 import pytest
 from iso_logic import ISOCore
 import os
+import re
 
 @pytest.fixture
 def iso_core():
@@ -97,47 +98,53 @@ def test_add_duplicate_file_overwrites(iso_core, tmp_path):
     # Add the second file with the same name
     new_content = b"new content is longer"
     new_path = tmp_path / "new_test.txt"
+    # Use a different name for creation, then rename to ensure it's a different file
     new_path.write_bytes(new_content)
-    os.rename(new_path, tmp_path / file_name) # Ensure it has the same name
+    os.rename(new_path, tmp_path / file_name)
 
     iso_core.add_file_to_directory(str(tmp_path / file_name), root_node)
 
+    # The list of children should still be 1, as the file is replaced.
     assert len(root_node['children']) == 1
+    # The size should be updated to the new file's size.
     assert root_node['children'][0]['size'] == len(new_content)
+    # The file data should be the new content.
+    assert root_node['children'][0]['file_data'] == new_content
 
 def test_add_file_to_file_node(iso_core, tmp_path):
-    """Test that adding a file to a node that is a file fails gracefully."""
+    """Test that adding a file to a node that is a file adds it to the parent directory."""
     root_node = iso_core.directory_tree
-    file_name = "test.txt"
-    file_content = b"hello world"
-    file_path = tmp_path / file_name
-    file_path.write_bytes(file_content)
+    # Add a file to the root
+    file1_path = tmp_path / "file1.txt"
+    file1_path.write_bytes(b"file1 content")
+    iso_core.add_file_to_directory(str(file1_path), root_node)
 
-    iso_core.add_file_to_directory(str(file_path), root_node)
     file_node = root_node['children'][0]
+    assert file_node['is_directory'] is False
 
-    another_file_name = "another.txt"
-    another_file_path = tmp_path / another_file_name
+    # Create a second file to add
+    another_file_path = tmp_path / "another.txt"
     another_file_path.write_bytes(b"another file")
 
-    # This should not raise an exception, but it also should not add the file.
-    # The logic in ISOCore will traverse up to the parent, which is root.
+    # Attempt to add the second file, targeting the first file node
     iso_core.add_file_to_directory(str(another_file_path), file_node)
 
+    # The file should have been added to the *parent* of the target node (the root)
     assert len(root_node['children']) == 2
+    assert root_node['children'][0]['name'] == 'file1.txt'
+    assert root_node['children'][1]['name'] == 'another.txt'
 
-def test_add_duplicate_folder(iso_core):
-    """Test that adding a folder with a name that already exists is handled."""
+def test_add_duplicate_folder_is_ignored(iso_core):
+    """Test that adding a folder with a name that already exists is ignored."""
     root_node = iso_core.directory_tree
     folder_name = "DUPLICATE"
     iso_core.add_folder_to_directory(folder_name, root_node)
+    assert len(root_node['children']) == 1
 
-    # In a correct implementation, this should probably raise an error
-    # or be ignored. For now, we'll test the current behavior, which
-    # is to add a second folder with the same name.
+    # Attempt to add the same folder again
     iso_core.add_folder_to_directory(folder_name, root_node)
 
-    # The new implementation should not add a duplicate folder.
+    # The number of children should remain 1
     assert len(root_node['children']) == 1
 
 def test_calculate_next_extent_location(iso_core):
@@ -187,55 +194,99 @@ def test_remove_node_with_no_parent(iso_core):
     # This should not raise an exception
     iso_core.remove_node(node)
 
-def test_load_iso_after_save(iso_core, tmp_path):
+def test_get_node_path(iso_core):
+    """Test the get_node_path utility function."""
+    root = iso_core.directory_tree
+    assert iso_core.get_node_path(root) == '/'
+
+    iso_core.add_folder_to_directory("DIR1", root)
+    dir1_node = root['children'][0]
+    assert iso_core.get_node_path(dir1_node) == '/DIR1'
+
+    iso_core.add_folder_to_directory("DIR2", dir1_node)
+    dir2_node = dir1_node['children'][0]
+    assert iso_core.get_node_path(dir2_node) == '/DIR1/DIR2'
+
+    # Create a fake file node to test file paths
+    file_node = {'name': 'file.txt', 'parent': dir2_node}
+    assert iso_core.get_node_path(file_node) == '/DIR1/DIR2/file.txt'
+
+def sanitize_for_iso9660(name):
+    # A simplified sanitizer for testing purposes.
+    # Replace invalid characters with underscores.
+    return re.sub(r'[^A-Z0-9_]', '_', name.upper())
+
+def test_complex_load_iso_after_save(iso_core, tmp_path):
     """
-    Test that loading an ISO after saving it results in the same structure.
-    This is an integration test for the parser and builder.
+    Test a more complex save/load cycle to better verify the parser and builder.
     """
-    # 1. Build a known structure
+    # 1. Build a complex structure
     root_node = iso_core.directory_tree
-    iso_core.add_folder_to_directory("DIR1", root_node)
+    # Use names that are valid for Joliet/RR but need sanitizing for base ISO9660
+    dir1_name = "dIR1"
+    long_dir_name = "long_directory_name" # Changed to be valid
+    long_file_name = "long file name with spaces.txt"
 
-    file1_content = b"file1"
-    file1_path = tmp_path / "file1.txt"
-    file1_path.write_bytes(file1_content)
-    iso_core.add_file_to_directory(str(file1_path), root_node.get('children')[0])
+    iso_core.add_folder_to_directory(dir1_name, root_node)
+    iso_core.add_folder_to_directory(long_dir_name, root_node)
 
-    file2_content = b"file2"
-    file2_path = tmp_path / "file2.txt"
-    file2_path.write_bytes(file2_content)
-    iso_core.add_file_to_directory(str(file2_path), root_node)
+    dir1_node = next(c for c in root_node['children'] if c['name'] == dir1_name)
+    long_dir_node = next(c for c in root_node['children'] if c['name'] == long_dir_name)
 
-    # 2. Save the ISO
-    output_iso_path = tmp_path / "test.iso"
+    # Add a file with a long name and spaces
+    long_file_content = b"long file content"
+    long_file_path = tmp_path / long_file_name
+    long_file_path.write_bytes(long_file_content)
+    iso_core.add_file_to_directory(str(long_file_path), root_node)
+
+    # Add a nested file
+    nested_content = b"nested"
+    nested_path = tmp_path / "nested.dat"
+    nested_path.write_bytes(nested_content)
+    iso_core.add_file_to_directory(str(nested_path), dir1_node)
+
+    # Add a file to the other directory
+    other_content = b"other"
+    other_path = tmp_path / "other.bin"
+    other_path.write_bytes(other_content)
+    iso_core.add_file_to_directory(str(other_path), long_dir_node)
+
+    # 2. Save the ISO (Joliet and Rock Ridge are important here)
+    output_iso_path = tmp_path / "test_complex.iso"
     iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
 
     # 3. Load the ISO into a new ISOCore instance
     new_iso_core = ISOCore()
     new_iso_core.load_iso(str(output_iso_path))
 
-    # 4. Assert the structure is the same
+    # 4. Assert the structure and content are identical
     new_root = new_iso_core.directory_tree
-    assert len(new_root['children']) == 2
+    # The root should contain the two directories and one file
+    assert len(new_root['children']) == 3
 
-    dir1 = next((c for c in new_root['children'] if c['name'] == 'DIR1'), None)
-    assert dir1 is not None
-    assert dir1['is_directory'] is True
+    # Find nodes (names should be preserved by Rock Ridge/Joliet)
+    new_dir1 = next((c for c in new_root['children'] if c['name'] == dir1_name), None)
+    new_long_dir = next((c for c in new_root['children'] if c['name'] == long_dir_name), None)
+    new_long_file = next((c for c in new_root['children'] if c['name'] == long_file_name), None)
 
-    file2 = next((c for c in new_root['children'] if c['name'] == 'file2.txt'), None)
-    assert file2 is not None
-    assert file2['is_directory'] is False
-    assert file2['size'] == len(file2_content)
+    assert new_dir1 is not None and new_dir1['is_directory']
+    assert new_long_dir is not None and new_long_dir['is_directory']
+    assert new_long_file is not None and not new_long_file['is_directory']
 
-    assert len(dir1['children']) == 1
-    file1 = dir1['children'][0]
-    assert file1['name'] == 'file1.txt'
-    assert file1['is_directory'] is False
-    assert file1['size'] == len(file1_content)
+    assert new_long_file['size'] == len(long_file_content)
+    assert new_iso_core.get_file_data(new_long_file) == long_file_content
 
-    # Also test get_file_data on the loaded ISO
-    assert new_iso_core.get_file_data(file1) == file1_content
-    assert new_iso_core.get_file_data(file2) == file2_content
+    assert len(new_dir1['children']) == 1
+    nested_file_node = new_dir1['children'][0]
+    assert nested_file_node['name'] == 'nested.dat'
+    assert nested_file_node['size'] == len(nested_content)
+    assert new_iso_core.get_file_data(nested_file_node) == nested_content
+
+    assert len(new_long_dir['children']) == 1
+    other_file_node = new_long_dir['children'][0]
+    assert other_file_node['name'] == 'other.bin'
+    assert other_file_node['size'] == len(other_content)
+    assert new_iso_core.get_file_data(other_file_node) == other_content
 
 def test_load_nonexistent_iso(iso_core):
     """Test that loading a non-existent ISO raises an error."""
@@ -264,3 +315,36 @@ def test_close_iso(iso_core, tmp_path):
     # Close it
     loaded_core.close_iso()
     assert loaded_core.iso_file_handle is None
+
+def test_close_iso_no_file(iso_core):
+    """Test that calling close_iso when no file is open does not error."""
+    try:
+        iso_core.close_iso()
+    except Exception as e:
+        pytest.fail(f"close_iso() raised an exception when no file was open: {e}")
+
+def test_find_non_compliant_filenames(iso_core, tmp_path):
+    """Test the filename validation method."""
+    root = iso_core.directory_tree
+
+    # Create dummy files to add
+    compliant_file_path = tmp_path / "MY_FILE.TXT"
+    compliant_file_path.write_text("content")
+
+    non_compliant_file_path = tmp_path / "file.with.dots"
+    non_compliant_file_path.write_text("content")
+
+    # These are compliant
+    iso_core.add_folder_to_directory("GOOD_NAME", root)
+    iso_core.add_file_to_directory(str(compliant_file_path), root)
+
+    # These are not compliant
+    iso_core.add_folder_to_directory("bad-name", root)
+    iso_core.add_folder_to_directory("another bad name", root)
+    iso_core.add_file_to_directory(str(non_compliant_file_path), root)
+
+    non_compliant = iso_core.find_non_compliant_filenames()
+
+    # Sort lists for consistent comparison
+    expected = sorted(["bad-name", "another bad name", "file.with.dots"])
+    assert sorted(non_compliant) == expected
