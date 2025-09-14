@@ -4,10 +4,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
     QFileDialog, QMessageBox, QInputDialog, QSplitter, QGroupBox,
-    QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton
+    QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton,
+    QProgressDialog, QCheckBox
 )
 from PySide6.QtGui import QAction
-from PySide6.QtCore import Qt, QPoint, Signal
+from PySide6.QtCore import Qt, QPoint, Signal, QThread
 import os
 import traceback
 from iso_logic import ISOCore
@@ -68,6 +69,53 @@ class DroppableTreeWidget(QTreeWidget):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+class SaveAsDialog(QDialog):
+    """
+    A dialog for saving an ISO with options for UDF and Hybrid ISO.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save ISO As")
+        self.layout = QVBoxLayout(self)
+
+        form_layout = QFormLayout()
+        self.file_path_edit = QLineEdit()
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse)
+
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(self.file_path_edit)
+        path_layout.addWidget(browse_button)
+
+        form_layout.addRow("Save to:", path_layout)
+
+        self.udf_checkbox = QCheckBox("Enable UDF Support")
+        self.udf_checkbox.setChecked(True)
+        form_layout.addRow(self.udf_checkbox)
+
+        self.hybrid_checkbox = QCheckBox("Create Hybrid ISO")
+        self.hybrid_checkbox.setChecked(False)
+        form_layout.addRow(self.hybrid_checkbox)
+
+        self.layout.addLayout(form_layout)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addWidget(self.buttons)
+
+    def browse(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        if file_path:
+            self.file_path_edit.setText(file_path)
+
+    def get_options(self):
+        return {
+            'file_path': self.file_path_edit.text(),
+            'use_udf': self.udf_checkbox.isChecked(),
+            'make_hybrid': self.hybrid_checkbox.isChecked()
+        }
 
 class PropertiesDialog(QDialog):
     """
@@ -298,7 +346,7 @@ class ISOEditor(QMainWindow):
     def open_iso(self):
         """Opens an ISO file and loads it into the editor."""
         logger.info("Open ISO action triggered.")
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open ISO", "", "ISO Files (*.iso);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Disc Images (*.iso *.cue);;All Files (*)")
         if not file_path:
             logger.info("Open ISO dialog cancelled.")
             return
@@ -341,18 +389,24 @@ class ISOEditor(QMainWindow):
     def save_iso_as(self):
         """Saves the current ISO to a new path."""
         logger.info("Save ISO As action triggered.")
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
-        if file_path:
-            self._perform_save(file_path)
+        dialog = SaveAsDialog(self)
+        if dialog.exec():
+            options = dialog.get_options()
+            if options['file_path']:
+                self._perform_save(options['file_path'], options['use_udf'], options['make_hybrid'])
+            else:
+                logger.info("Save As dialog cancelled.")
         else:
             logger.info("Save As dialog cancelled.")
 
-    def _perform_save(self, file_path):
+    def _perform_save(self, file_path, use_udf, make_hybrid):
         """
         Performs the save operation, including filename validation.
 
         Args:
             file_path (str): The path to save the ISO to.
+            use_udf (bool): Whether to use UDF.
+            make_hybrid (bool): Whether to make the ISO a hybrid ISO.
         """
         logger.info(f"Attempting to save ISO to {file_path}")
 
@@ -374,17 +428,63 @@ class ISOEditor(QMainWindow):
                 self.update_status("Save cancelled by user.")
                 return
 
-        self.update_status("Building ISO...")
+        self.progress_dialog = QProgressDialog("Building ISO...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.canceled.connect(self.cancel_save)
+
+        self.save_thread = SaveWorker(self.core, file_path, use_udf, make_hybrid)
+        self.save_thread.progress.connect(self.update_progress)
+        self.save_thread.finished.connect(self.save_finished)
+        self.save_thread.error.connect(self.save_error)
+
+        self.save_thread.start()
+        self.progress_dialog.exec()
+
+    def update_progress(self, value):
+        self.progress_dialog.setValue(value)
+
+    def cancel_save(self):
+        if self.save_thread.isRunning():
+            self.save_thread.terminate()
+            self.update_status("Save cancelled.")
+
+    def save_finished(self, file_path):
+        self.progress_dialog.setValue(100)
+        self.refresh_view()
+        self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
+        logger.info(f"ISO saved successfully to {file_path}")
+        QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+
+    def save_error(self, error_message):
+        self.progress_dialog.close()
+        logger.exception(f"An error occurred while saving the ISO: {error_message}")
+        QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {error_message}")
+        self.update_status("Error saving ISO.")
+
+class SaveWorker(QThread):
+    progress = Signal(int)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, core, file_path, use_udf, make_hybrid):
+        super().__init__()
+        self.core = core
+        self.file_path = file_path
+        self.use_udf = use_udf
+        self.make_hybrid = make_hybrid
+
+    def run(self):
         try:
-            self.core.save_iso(file_path, use_joliet=True, use_rock_ridge=True)
-            self.refresh_view()
-            self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
-            logger.info(f"ISO saved successfully to {file_path}")
-            QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+            # The progress callback for pycdlib's write method
+            def progress_cb(done, total, opaque):
+                percent = (done * 100) // total
+                self.progress.emit(percent)
+
+            self.core.save_iso(self.file_path, use_joliet=True, use_rock_ridge=True, progress_callback=progress_cb, use_udf=self.use_udf, make_hybrid=self.make_hybrid)
+            self.finished.emit(self.file_path)
         except Exception as e:
-            logger.exception(f"An error occurred while saving the ISO to {file_path}")
-            QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {str(e)}")
-            self.update_status("Error saving ISO.")
+            self.error.emit(str(e))
 
     def get_selected_node(self):
         """

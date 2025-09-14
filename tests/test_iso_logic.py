@@ -86,7 +86,7 @@ def test_save_iso_with_boot_image(iso_core, tmp_path):
 
     # Run the save operation
     try:
-        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True, make_hybrid=False)
     except Exception as e:
         pytest.fail(f"save_iso raised an exception with a boot image: {e}")
 
@@ -115,7 +115,7 @@ def test_save_iso_with_hybrid_boot(iso_core, tmp_path):
 
     # Run the save operation
     try:
-        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True, make_hybrid=False)
     except Exception as e:
         pytest.fail(f"save_iso raised an exception with hybrid boot images: {e}")
 

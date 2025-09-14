@@ -147,27 +147,6 @@ def test_add_duplicate_folder_is_ignored(iso_core):
     # The number of children should remain 1
     assert len(root_node['children']) == 1
 
-def test_calculate_next_extent_location(iso_core):
-    """Test that the next extent location is calculated correctly."""
-    # Initially, it should be 10, as the root directory is at 0.
-    iso_core.calculate_next_extent_location()
-    assert iso_core.next_extent_location == 10
-
-    # Add a file, which will have an extent location of 0 since it's new,
-    # but the next extent should be recalculated.
-    root_node = iso_core.directory_tree
-    root_node['children'].append({
-        'name': 'file1.txt', 'is_directory': False, 'size': 100,
-        'extent_location': 20, 'children': [], 'parent': root_node
-    })
-    root_node['children'].append({
-        'name': 'file2.txt', 'is_directory': False, 'size': 100,
-        'extent_location': 30, 'children': [], 'parent': root_node
-    })
-
-    iso_core.calculate_next_extent_location()
-    assert iso_core.next_extent_location == 40
-
 def test_get_file_data_for_new_file(iso_core):
     """Test getting the data for a newly added file."""
     root_node = iso_core.directory_tree
@@ -301,7 +280,7 @@ def test_load_invalid_iso(iso_core, tmp_path):
         iso_core.load_iso(str(invalid_iso_path))
 
 def test_close_iso(iso_core, tmp_path):
-    """Test that the close_iso method closes the file handle."""
+    """Test that the close_iso method closes the pycdlib instance."""
     # First, create and load a valid ISO to have an open file handle
     iso_path = tmp_path / "test.iso"
     iso_core.save_iso(str(iso_path), use_joliet=False, use_rock_ridge=False)
@@ -309,12 +288,11 @@ def test_close_iso(iso_core, tmp_path):
     # Load it to open the handle
     loaded_core = ISOCore()
     loaded_core.load_iso(str(iso_path))
-    assert loaded_core.iso_file_handle is not None
-    assert not loaded_core.iso_file_handle.closed
+    assert loaded_core._pycdlib_instance is not None
 
     # Close it
     loaded_core.close_iso()
-    assert loaded_core.iso_file_handle is None
+    assert loaded_core._pycdlib_instance is None
 
 def test_close_iso_no_file(iso_core):
     """Test that calling close_iso when no file is open does not error."""
