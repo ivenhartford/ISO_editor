@@ -528,39 +528,51 @@ class SaveWorker(QThread):
     def add_folder(self):
         """Adds a folder to the ISO."""
         logger.info("Add Folder action triggered.")
-        target_node = self.get_selected_node() or self.core.directory_tree
-        if not target_node['is_directory']:
-            target_node = target_node['parent']
+        try:
+            target_node = self.get_selected_node() or self.core.directory_tree
+            if not target_node.get('is_directory'):
+                target_node = target_node.get('parent')
 
-        folder_name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
-        if not ok or not folder_name:
-            logger.info("Add Folder dialog cancelled.")
-            return
+            folder_name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
+            if not ok or not folder_name:
+                logger.info("Add Folder dialog cancelled.")
+                return
 
-        if any(c['name'].lower() == folder_name.lower() for c in target_node['children']):
-            logger.warning(f"Attempted to create a folder with an existing name: {folder_name}")
-            QMessageBox.critical(self, "Folder Exists", f"Folder '{folder_name}' already exists.")
-            return
+            if any(c['name'].lower() == folder_name.lower() for c in target_node.get('children', [])):
+                logger.warning(f"Attempted to create a folder with an existing name: {folder_name}")
+                QMessageBox.warning(self, "Folder Exists", f"A folder with the name '{folder_name}' already exists.")
+                return
 
-        self.core.add_folder_to_directory(folder_name, target_node)
-        self.refresh_view()
+            self.core.add_folder_to_directory(folder_name, target_node)
+            self.refresh_view()
+            self.update_status(f"Added folder: {folder_name}")
+        except Exception as e:
+            logger.exception(f"Failed to add folder: {e}")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred while adding the folder: {e}")
 
     def remove_selected(self):
         """Removes the selected file or folder from the ISO."""
         logger.info("Remove Selected action triggered.")
-        node = self.get_selected_node()
-        if not node or node == self.core.directory_tree:
-            logger.debug("Remove selected called with no valid node selected.")
-            return
+        try:
+            node = self.get_selected_node()
+            if not node or node == self.core.directory_tree:
+                logger.debug("Remove selected called with no valid node selected or root selected.")
+                return
 
-        reply = QMessageBox.question(self, "Confirm Removal", f"Are you sure you want to remove '{node['name']}'?",
-                                       QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            logger.info(f"User confirmed removal of node: {node['name']}")
-            self.core.remove_node(node)
-            self.refresh_view()
-        else:
-            logger.info(f"User cancelled removal of node: {node['name']}")
+            node_name = node.get('name', 'the selected item')
+            reply = QMessageBox.question(self, "Confirm Removal", f"Are you sure you want to remove '{node_name}'?",
+                                           QMessageBox.Yes | QMessageBox.No)
+
+            if reply == QMessageBox.Yes:
+                logger.info(f"User confirmed removal of node: {node_name}")
+                self.core.remove_node(node)
+                self.refresh_view()
+                self.update_status(f"Removed '{node_name}'")
+            else:
+                logger.info(f"User cancelled removal of node: {node_name}")
+        except Exception as e:
+            logger.exception(f"Failed to remove selected item: {e}")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred while removing the item: {e}")
 
     def import_directory(self):
         """Imports a directory from the local filesystem into the ISO."""
@@ -613,26 +625,50 @@ class SaveWorker(QThread):
 
     def _extract_node_recursive(self, node, extract_path):
         """
-        Recursively extracts a node and its children.
+        Recursively extracts a node and its children. Handles exceptions at each step.
 
         Args:
             node (dict): The node to extract.
             extract_path (str): The path to extract to.
         """
+        node_name = node.get('name', 'Unnamed')
         try:
-            if node['is_directory']:
+            if node.get('is_directory'):
+                # Create the directory for the current node
                 os.makedirs(extract_path, exist_ok=True)
-                for child in node['children']:
-                    child_path = os.path.join(extract_path, child['name'])
-                    self._extract_node_recursive(child, child_path)
+                logger.info(f"Created directory: {extract_path}")
+
+                # Recursively extract children
+                for child in node.get('children', []):
+                    child_path = os.path.join(extract_path, child.get('name', 'Unnamed_Child'))
+                    self._extract_node_recursive(child, child_path) # This will handle its own exceptions
             else:
+                # Get file data from the core logic
                 file_data = self.core.get_file_data(node)
-                os.makedirs(os.path.dirname(extract_path), exist_ok=True)
+                if file_data is None:
+                    # This can happen if get_file_data returns None on error
+                    raise IOError(f"Failed to retrieve data for file '{node_name}' from ISO.")
+
+                # Ensure parent directory exists before writing
+                parent_dir = os.path.dirname(extract_path)
+                os.makedirs(parent_dir, exist_ok=True)
+
+                # Write the file data
                 with open(extract_path, 'wb') as f:
                     f.write(file_data)
+                logger.info(f"Extracted file: {extract_path}")
+
+        except (IOError, OSError) as e:
+            # Catch file system related errors (permissions, disk full, etc.)
+            error_message = f"A file system error occurred while extracting '{node_name}': {e}"
+            logger.exception(error_message)
+            # We re-raise to let the top-level caller handle the UI notification
+            raise IOError(error_message) from e
         except Exception as e:
-            logger.exception(f"Error during recursive extraction of {node.get('name')}: {e}")
-            raise
+            # Catch any other unexpected errors
+            error_message = f"An unexpected error occurred during the extraction of '{node_name}': {e}"
+            logger.exception(error_message)
+            raise Exception(error_message) from e
 
     def handle_drop(self, urls):
         """
