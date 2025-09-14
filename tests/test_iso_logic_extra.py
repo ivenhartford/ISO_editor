@@ -322,3 +322,29 @@ def test_close_iso_no_file(iso_core):
         iso_core.close_iso()
     except Exception as e:
         pytest.fail(f"close_iso() raised an exception when no file was open: {e}")
+
+def test_find_non_compliant_filenames(iso_core, tmp_path):
+    """Test the filename validation method."""
+    root = iso_core.directory_tree
+
+    # Create dummy files to add
+    compliant_file_path = tmp_path / "MY_FILE.TXT"
+    compliant_file_path.write_text("content")
+
+    non_compliant_file_path = tmp_path / "file.with.dots"
+    non_compliant_file_path.write_text("content")
+
+    # These are compliant
+    iso_core.add_folder_to_directory("GOOD_NAME", root)
+    iso_core.add_file_to_directory(str(compliant_file_path), root)
+
+    # These are not compliant
+    iso_core.add_folder_to_directory("bad-name", root)
+    iso_core.add_folder_to_directory("another bad name", root)
+    iso_core.add_file_to_directory(str(non_compliant_file_path), root)
+
+    non_compliant = iso_core.find_non_compliant_filenames()
+
+    # Sort lists for consistent comparison
+    expected = sorted(["bad-name", "another bad name", "file.with.dots"])
+    assert sorted(non_compliant) == expected

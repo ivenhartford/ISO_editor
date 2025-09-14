@@ -349,12 +349,31 @@ class ISOEditor(QMainWindow):
 
     def _perform_save(self, file_path):
         """
-        Performs the save operation.
+        Performs the save operation, including filename validation.
 
         Args:
             file_path (str): The path to save the ISO to.
         """
         logger.info(f"Attempting to save ISO to {file_path}")
+
+        # Validate filenames before saving
+        non_compliant_files = self.core.find_non_compliant_filenames()
+        if non_compliant_files:
+            message = (
+                "The following filenames are not compliant with the strict ISO9660 standard:\n\n"
+                f"{', '.join(non_compliant_files[:5])}{'...' if len(non_compliant_files) > 5 else ''}\n\n"
+                "These names will be automatically adjusted for maximum compatibility. "
+                "This is usually safe.\n\n"
+                "Do you want to continue?"
+            )
+            reply = QMessageBox.warning(self, "Filename Warning", message,
+                                        QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+
+            if reply == QMessageBox.StandardButton.Cancel:
+                logger.info("User cancelled save due to non-compliant filenames.")
+                self.update_status("Save cancelled by user.")
+                return
+
         self.update_status("Building ISO...")
         try:
             self.core.save_iso(file_path, use_joliet=True, use_rock_ridge=True)

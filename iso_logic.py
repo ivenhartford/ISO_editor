@@ -442,6 +442,40 @@ class ISOCore:
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts))
 
+    def find_non_compliant_filenames(self):
+        """
+        Scans the directory tree for filenames that do not comply with the
+        strict ISO9660 Level 1 standard.
+
+        Returns:
+            list: A list of non-compliant filenames.
+        """
+        non_compliant_files = []
+        iso9660_pattern = re.compile(r'^[A-Z0-9_]+$')
+
+        def check_node(node):
+            if node['name'] != '/':
+                # ISO9660 does not allow more than one dot.
+                if node['name'].count('.') > 1:
+                    non_compliant_files.append(node['name'])
+
+                base, ext = os.path.splitext(node['name'])
+                if ext:
+                    ext = ext[1:] # remove leading dot
+
+                # Check for invalid characters in the base filename and extension
+                if not iso9660_pattern.match(base.upper()) or \
+                   (ext and not iso9660_pattern.match(ext.upper())):
+                    non_compliant_files.append(node['name'])
+
+            for child in node.get('children', []):
+                check_node(child)
+
+        if self.directory_tree:
+            check_node(self.directory_tree)
+
+        return list(set(non_compliant_files))
+
     def calculate_next_extent_location(self):
         """Calculates the next available LBA for writing new data."""
         max_extent = 0
