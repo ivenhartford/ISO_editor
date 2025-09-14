@@ -120,11 +120,20 @@ class ISOCore:
 
     def _load_cue_sheet(self, file_path):
         """Builds the internal directory_tree from a CUE sheet."""
-        with open(file_path, 'r') as f:
-            cue_sheet = CueSheet()
-            cue_sheet.setOutputFormat('%performer% - %title%', '%performer% - %title%')
-            cue_sheet.setData(f.read())
-            cue_sheet.parse()
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                cue_data = f.read()
+        except FileNotFoundError:
+            logger.error(f"CUE file not found at path: {file_path}")
+            raise IOError(f"CUE file not found at path: {file_path}") from None
+        except Exception as e:
+            logger.error(f"Error reading CUE file {file_path}: {e}")
+            raise IOError(f"Error reading CUE file: {e}") from e
+
+        cue_sheet = CueSheet()
+        cue_sheet.setOutputFormat('%performer% - %title%', '%performer% - %title%')
+        cue_sheet.setData(cue_data)
+        cue_sheet.parse()
 
         self.volume_descriptor['volume_id'] = cue_sheet.title or "CUE_SHEET"
 
@@ -165,12 +174,16 @@ class ISOCore:
 
     def _parse_cue_offset(self, offset_str):
         """Converts a CUE sheet offset string (MM:SS:FF) to bytes."""
-        parts = offset_str.split(':')
-        minutes = int(parts[0])
-        seconds = int(parts[1])
-        frames = int(parts[2])
-        total_frames = (minutes * 60 * 75) + (seconds * 75) + frames
-        return total_frames * 2352 # 2352 bytes per frame for CD-DA
+        try:
+            parts = offset_str.split(':')
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            frames = int(parts[2])
+            total_frames = (minutes * 60 * 75) + (seconds * 75) + frames
+            return total_frames * 2352 # 2352 bytes per frame for CD-DA
+        except (ValueError, IndexError) as e:
+            logger.error(f"Could not parse CUE offset string: '{offset_str}'. Error: {e}")
+            raise ValueError(f"Invalid CUE offset format: '{offset_str}'") from e
 
     def _build_tree_from_pycdlib(self):
         """Builds the internal directory_tree structure from the loaded pycdlib instance."""
@@ -310,11 +323,15 @@ class ISOCore:
             offset = node['cue_offset']
             size = node['size']
             if os.path.exists(bin_path):
-                with open(bin_path, 'rb') as f:
-                    f.seek(offset)
-                    return f.read(size)
+                try:
+                    with open(bin_path, 'rb') as f:
+                        f.seek(offset)
+                        return f.read(size)
+                except (IOError, OSError) as e:
+                    logger.error(f"Error reading BIN file '{bin_path}': {e}")
+                    return b''
             else:
-                logger.warning(f"BIN file not found: {bin_path}")
+                logger.error(f"BIN file not found: {bin_path}")
                 return b''
 
         if not self._pycdlib_instance:
@@ -396,11 +413,28 @@ class ISOCore:
         Args:
             node_to_remove (dict): The node to remove.
         """
-        parent = node_to_remove.get('parent')
-        if parent:
-            logger.info(f"Removing node '{node_to_remove['name']}' from '{self.get_node_path(parent)}'")
-            parent['children'] = [c for c in parent['children'] if id(c) != id(node_to_remove)]
-            self.iso_modified = True
+        try:
+            parent = node_to_remove.get('parent')
+            if parent and 'children' in parent:
+                node_name = node_to_remove.get('name', 'Unnamed')
+                parent_path = self.get_node_path(parent)
+                logger.info(f"Removing node '{node_name}' from '{parent_path}'")
+                original_len = len(parent['children'])
+                parent['children'] = [c for c in parent['children'] if id(c) != id(node_to_remove)]
+
+                if len(parent['children']) < original_len:
+                    self.iso_modified = True
+                    logger.info(f"Successfully removed node '{node_name}'.")
+                else:
+                    logger.warning(f"Node '{node_name}' not found in parent '{parent_path}' for removal.")
+            elif not parent:
+                logger.error("Cannot remove node: node has no parent.")
+            else: # parent exists but has no 'children' key
+                logger.error("Cannot remove node: parent is malformed and has no 'children' list.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while removing a node: {e}")
+            # Depending on desired robustness, you might want to re-raise or handle differently
+            raise
 
     def get_node_path(self, node):
         """
@@ -481,13 +515,17 @@ class ISOBuilder:
         logger.info("Starting ISO build process with pycdlib.")
 
         udf_version = '2.60' if self.use_udf else None
-        self.iso.new(
-            interchange_level=3,
-            vol_ident=self.volume_id,
-            joliet=3 if self.use_joliet else None,
-            rock_ridge='1.09' if self.use_rock_ridge else None,
-            udf=udf_version
-        )
+        try:
+            self.iso.new(
+                interchange_level=3,
+                vol_ident=self.volume_id,
+                joliet=3 if self.use_joliet else None,
+                rock_ridge='1.09' if self.use_rock_ridge else None,
+                udf=udf_version
+            )
+        except Exception as e:
+            logger.exception(f"Failed to initialize new ISO with pycdlib: {e}")
+            raise
 
         all_nodes = self._get_all_nodes_flat(self.root_node, '/', '/', '/')
         all_nodes.sort(key=lambda x: x[0].count('/'))
