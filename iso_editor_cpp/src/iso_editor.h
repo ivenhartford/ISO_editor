@@ -2,10 +2,11 @@
 #define ISOEDITOR_H
 
 #include <QMainWindow>
-#include <QTreeWidget>
-#include "iso_core.h" // Include the core logic header
+#include <QMap>
+#include "iso_core.h"
+#include "droppable_tree_widget.h" // Include the custom widget header
 
-// Forward declarations of Qt classes
+// Forward declarations
 class QAction;
 class QLabel;
 class QMenu;
@@ -20,47 +21,49 @@ public:
     explicit ISOEditor(QWidget *parent = nullptr);
 
 private slots:
-    // Slots for menu actions
+    // Menu actions
     void newIso();
     void openIso();
-    // ... more slots later
+    void addFolder();
+    void removeSelected();
+    void addFile();
+    void saveIso();
+    void saveIsoAs();
+    void showIsoProperties();
+
+    // Other UI slots
+    void handleDrop(const QStringList &filePaths);
 
 private:
-    // Private methods to set up the UI
+    // UI setup
     void createActions();
     void createMenus();
     void createMainInterface();
     void createStatusBar();
-    void refreshView(); // Method to update the UI from the core
-    void populateTreeNode(QTreeWidgetItem *parentItem, const IsoNode *parentNode);
+    void refreshView();
+    void populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNode);
+    IsoNode* getSelectedNode();
 
     // Core logic handler
     ISOCore m_core;
 
+    // Map to link UI items to core data nodes
+    QMap<QTreeWidgetItem*, IsoNode*> m_treeItemMap;
+
     // UI Widgets
-    QTreeWidget *isoContentsTree;
+    DroppableTreeWidget *isoContentsTree;
     QLabel *isoInfoLabel;
     QLabel *volumeNameLabel;
     QSplitter *mainSplitter;
     QStatusBar *mainStatusBar;
 
-    // Menus
+    // Menus & Actions
     QMenu *fileMenu;
     QMenu *editMenu;
     QMenu *viewMenu;
-
-    // Actions
-    QAction *newAction;
-    QAction *openAction;
-    QAction *saveAction;
-    QAction *saveAsAction;
-    QAction *exitAction;
-    QAction *addFileAction;
-    QAction *addFolderAction;
-    QAction *importDirAction;
-    QAction *removeAction;
-    QAction *propertiesAction;
-    QAction *refreshAction;
+    QAction *newAction, *openAction, *saveAction, *saveAsAction, *exitAction;
+    QAction *addFileAction, *addFolderAction, *importDirAction, *removeAction;
+    QAction *propertiesAction, *refreshAction;
 };
 
 #endif // ISOEDITOR_H

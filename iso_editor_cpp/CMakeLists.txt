@@ -22,6 +22,7 @@ add_executable(iso_editor
     src/save_as_dialog.cpp
     src/properties_dialog.cpp
     src/iso_core.cpp
+    src/droppable_tree_widget.cpp
 )
 
 target_link_libraries(iso_editor PRIVATE

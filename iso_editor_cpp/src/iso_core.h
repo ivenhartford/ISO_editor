@@ -4,6 +4,9 @@
 #include <QString>
 #include <QList>
 #include <QDateTime>
+#include <QByteArray>
+
+#include <cdio/cdio.h> // For lsn_t
 
 // Represents a file or directory within the ISO structure.
 struct IsoNode
@@ -14,11 +17,13 @@ struct IsoNode
     quint64 size = 0;
     QDateTime date;
 
+    QByteArray fileData;
+    bool isNew = false;
+    lsn_t lsn = 0;
+
     QList<IsoNode*> children;
     IsoNode* parent = nullptr;
 
-    // A simple way to clean up the tree.
-    // A real implementation might use smart pointers.
     ~IsoNode() {
         qDeleteAll(children);
     }
@@ -29,12 +34,9 @@ struct VolumeDescriptor
 {
     QString systemId;
     QString volumeId;
-    quint64 volumeSize = 0;
-    int logicalBlockSize = 2048;
 };
 
 // This class will encapsulate all the logic for ISO manipulation.
-// For now, it's just a placeholder (a "stub").
 class ISOCore
 {
 public:
@@ -47,19 +49,31 @@ public:
 
     // Methods to interact with the file tree
     void addFileToDirectory(const QString &filePath, IsoNode *targetNode);
+    void importDirectory(const QString &dirPath, IsoNode *targetNode);
     void addFolderToDirectory(const QString &folderName, IsoNode *targetNode);
     void removeNode(IsoNode *node);
+    QByteArray getFileData(const IsoNode* node) const;
 
-    // Getters for UI state
+    // Getters
     const IsoNode* getDirectoryTree() const;
+    IsoNode* getDirectoryTree();
     const VolumeDescriptor& getVolumeDescriptor() const;
+    QString getBootImagePath() const;
+    QString getEfiBootImagePath() const;
     bool isModified() const;
 
+    // Setters
+    void setVolumeDescriptor(const VolumeDescriptor& vd);
+    void setBootImagePath(const QString& path);
+    void setEfiBootImagePath(const QString& path);
+
 private:
-    void clear(); // Helper to clean up the tree
+    void clear();
 
     IsoNode* rootNode;
     VolumeDescriptor volumeDescriptor;
+    QString bootImagePath;
+    QString efiBootImagePath;
     bool modified;
     QString currentIsoPath;
 };
