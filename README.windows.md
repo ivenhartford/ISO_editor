@@ -25,6 +25,7 @@ pacman -S --noconfirm \
 
 This will install the C++ compiler (as part of the `toolchain`), CMake, Qt6, and the required C++ libraries.
 
+
 ## 3. Build the Application
 
 Once the dependencies are installed, you can build the application.
