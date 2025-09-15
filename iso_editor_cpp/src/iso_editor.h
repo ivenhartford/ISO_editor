@@ -12,6 +12,7 @@ class QLabel;
 class QMenu;
 class QSplitter;
 class QStatusBar;
+class QToolBar;
 
 class ISOEditor : public QMainWindow
 {
@@ -34,6 +35,7 @@ private slots:
 private:
     void createActions();
     void createMenus();
+    void createToolBar();
     void createMainInterface();
     void createStatusBar();
     void refreshView();
@@ -53,6 +55,7 @@ private:
     QStatusBar *mainStatusBar;
 
     QMenu *fileMenu, *editMenu, *viewMenu;
+    QToolBar *fileToolBar;
     QAction *newAction, *openAction, *saveAction, *saveAsAction, *exitAction;
     QAction *addFileAction, *addFolderAction, *importDirAction, *removeAction;
     QAction *propertiesAction, *refreshAction;
