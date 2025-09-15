@@ -32,7 +32,6 @@ ISOEditor::ISOEditor(QWidget *parent)
     createMainInterface();
     createStatusBar();
 
-    // Connect actions to slots
     connect(newAction, &QAction::triggered, this, &ISOEditor::newIso);
     connect(openAction, &QAction::triggered, this, &ISOEditor::openIso);
     connect(addFolderAction, &QAction::triggered, this, &ISOEditor::addFolder);
@@ -42,21 +41,49 @@ ISOEditor::ISOEditor(QWidget *parent)
     connect(saveAsAction, &QAction::triggered, this, &ISOEditor::saveIsoAs);
     connect(propertiesAction, &QAction::triggered, this, &ISOEditor::showIsoProperties);
     connect(exitAction, &QAction::triggered, this, &ISOEditor::close);
-
-    // Connect the drop signal
     connect(isoContentsTree, &DroppableTreeWidget::filesDropped, this, &ISOEditor::handleDrop);
 
-    refreshView(); // Initial view setup
+    refreshView();
 }
 
 void ISOEditor::createActions()
 {
-    // ... (implementation is unchanged)
+    newAction = new QAction("&New ISO...", this);
+    openAction = new QAction("&Open ISO...", this);
+    saveAction = new QAction("&Save ISO", this);
+    saveAsAction = new QAction("Save ISO &As...", this);
+    exitAction = new QAction("E&xit", this);
+    addFileAction = new QAction("Add &File...", this);
+    addFolderAction = new QAction("Add F&older...", this);
+    importDirAction = new QAction("&Import Directory...", this);
+    removeAction = new QAction("&Remove Selected", this);
+    propertiesAction = new QAction("ISO &Properties...", this);
+    refreshAction = new QAction("&Refresh", this);
+    connect(refreshAction, &QAction::triggered, this, &ISOEditor::refreshView);
 }
 
 void ISOEditor::createMenus()
 {
-    // ... (implementation is unchanged)
+    fileMenu = menuBar()->addMenu("&File");
+    fileMenu->addAction(newAction);
+    fileMenu->addAction(openAction);
+    fileMenu->addSeparator();
+    fileMenu->addAction(saveAction);
+    fileMenu->addAction(saveAsAction);
+    fileMenu->addSeparator();
+    fileMenu->addAction(exitAction);
+
+    editMenu = menuBar()->addMenu("&Edit");
+    editMenu->addAction(addFileAction);
+    editMenu->addAction(addFolderAction);
+    editMenu->addAction(importDirAction);
+    editMenu->addSeparator();
+    editMenu->addAction(removeAction);
+    editMenu->addSeparator();
+    editMenu->addAction(propertiesAction);
+
+    viewMenu = menuBar()->addMenu("&View");
+    viewMenu->addAction(refreshAction);
 }
 
 void ISOEditor::createMainInterface()
@@ -64,9 +91,7 @@ void ISOEditor::createMainInterface()
     auto *centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
     auto *mainLayout = new QHBoxLayout(centralWidget);
-
     mainSplitter = new QSplitter(Qt::Horizontal);
-
     auto *leftPane = new QGroupBox("ISO Properties");
     auto *leftLayout = new QVBoxLayout(leftPane);
     isoInfoLabel = new QLabel();
@@ -77,15 +102,13 @@ void ISOEditor::createMainInterface()
     leftLayout->addWidget(volumeNameLabel);
     leftLayout->addStretch();
     mainSplitter->addWidget(leftPane);
-
     auto *rightPane = new QGroupBox("ISO Contents");
     auto *rightLayout = new QVBoxLayout(rightPane);
-    isoContentsTree = new DroppableTreeWidget(); // Use the custom widget
+    isoContentsTree = new DroppableTreeWidget();
     isoContentsTree->setHeaderLabels({"Name", "Size", "Date Modified", "Type"});
     isoContentsTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     rightLayout->addWidget(isoContentsTree);
     mainSplitter->addWidget(rightPane);
-
     mainSplitter->setSizes({250, 550});
     mainLayout->addWidget(mainSplitter);
 }
@@ -99,7 +122,6 @@ void ISOEditor::refreshView()
 {
     isoContentsTree->clear();
     m_treeItemMap.clear();
-
     IsoNode* rootNode = m_core.getDirectoryTree();
     if (rootNode) {
         auto* rootItem = new QTreeWidgetItem(isoContentsTree, QStringList(rootNode->name));
@@ -107,11 +129,9 @@ void ISOEditor::refreshView()
         populateTreeNode(rootItem, rootNode);
         rootItem->setExpanded(true);
     }
-
     const VolumeDescriptor& vd = m_core.getVolumeDescriptor();
     volumeNameLabel->setText(QString("Volume Name: %1").arg(vd.volumeId));
     isoInfoLabel->setText(QString("System ID: %1").arg(vd.systemId));
-
     mainStatusBar->showMessage(m_core.isModified() ? "Modified" : "Ready");
 }
 
@@ -125,7 +145,6 @@ void ISOEditor::populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNod
         } else {
             rowData << QString::number(childNode->size) << childNode->date.toString() << "File";
         }
-
         auto* childItem = new QTreeWidgetItem(parentItem, rowData);
         m_treeItemMap[childItem] = childNode;
         if (!childNode->children.isEmpty()) {
@@ -137,9 +156,7 @@ void ISOEditor::populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNod
 IsoNode* ISOEditor::getSelectedNode()
 {
     QList<QTreeWidgetItem*> selectedItems = isoContentsTree->selectedItems();
-    if (selectedItems.isEmpty()) {
-        return m_core.getDirectoryTree();
-    }
+    if (selectedItems.isEmpty()) return m_core.getDirectoryTree();
     return m_treeItemMap.value(selectedItems.first(), m_core.getDirectoryTree());
 }
 
@@ -186,8 +203,7 @@ void ISOEditor::removeSelected()
 {
     IsoNode* nodeToRemove = getSelectedNode();
     if (!nodeToRemove || nodeToRemove == m_core.getDirectoryTree()) return;
-    QMessageBox::StandardButton reply;
-    reply = QMessageBox::question(this, "Confirm Removal", QString("Are you sure you want to remove '%1'?").arg(nodeToRemove->name), QMessageBox::Yes|QMessageBox::No);
+    QMessageBox::StandardButton reply = QMessageBox::question(this, "Confirm Removal", QString("Are you sure you want to remove '%1'?").arg(nodeToRemove->name), QMessageBox::Yes|QMessageBox::No);
     if (reply == QMessageBox::Yes) {
         m_core.removeNode(nodeToRemove);
         refreshView();
@@ -196,8 +212,16 @@ void ISOEditor::removeSelected()
 
 void ISOEditor::saveIso()
 {
-    // Simplified: always do "Save As" for now
-    saveIsoAs();
+    if (m_core.getCurrentPath().isEmpty()) {
+        saveIsoAs();
+    } else {
+        if (!m_core.saveIso(m_core.getCurrentPath(), true, false)) {
+            QMessageBox::critical(this, "Error", "Failed to save the ISO image.");
+        } else {
+            QMessageBox::information(this, "Success", "ISO saved successfully.");
+            refreshView();
+        }
+    }
 }
 
 void ISOEditor::saveIsoAs()
@@ -206,7 +230,7 @@ void ISOEditor::saveIsoAs()
     if (dialog.exec() == QDialog::Accepted) {
         SaveOptions options = dialog.getOptions();
         if (options.filePath.isEmpty()) return;
-        if (!m_core.saveIso(options.filePath)) {
+        if (!m_core.saveIso(options.filePath, options.useUdf, options.makeHybrid)) {
             QMessageBox::critical(this, "Error", "Failed to save the ISO image.");
         } else {
             QMessageBox::information(this, "Success", "ISO saved successfully.");
@@ -233,10 +257,7 @@ void ISOEditor::showIsoProperties()
 void ISOEditor::handleDrop(const QStringList &filePaths)
 {
     IsoNode* targetNode = getSelectedNode();
-    if (!targetNode->isDirectory) {
-        targetNode = targetNode->parent;
-    }
-
+    if (!targetNode->isDirectory) targetNode = targetNode->parent;
     for (const QString& path : filePaths) {
         QFileInfo info(path);
         if (info.isDir()) {

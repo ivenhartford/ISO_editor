@@ -17,9 +17,17 @@ struct IsoNode
     quint64 size = 0;
     QDateTime date;
 
+    // Data for new files
     QByteArray fileData;
     bool isNew = false;
+
+    // Data for existing files from a standard ISO
     lsn_t lsn = 0;
+
+    // Data for tracks from a CUE sheet
+    bool isCueTrack = false;
+    QString cueBinFile;
+    quint64 cueOffset = 0;
 
     QList<IsoNode*> children;
     IsoNode* parent = nullptr;
@@ -45,7 +53,7 @@ public:
 
     void initNewIso();
     bool loadIso(const QString &filePath);
-    bool saveIso(const QString &filePath);
+    bool saveIso(const QString &filePath, bool useUdf, bool makeHybrid);
 
     // Methods to interact with the file tree
     void addFileToDirectory(const QString &filePath, IsoNode *targetNode);
@@ -60,6 +68,7 @@ public:
     const VolumeDescriptor& getVolumeDescriptor() const;
     QString getBootImagePath() const;
     QString getEfiBootImagePath() const;
+    QString getCurrentPath() const;
     bool isModified() const;
 
     // Setters
@@ -68,6 +77,7 @@ public:
     void setEfiBootImagePath(const QString& path);
 
 private:
+    bool loadCueSheet(const QString &filePath);
     void clear();
 
     IsoNode* rootNode;

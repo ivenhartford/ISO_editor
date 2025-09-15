@@ -101,3 +101,46 @@ TEST_F(ISOCoreTest, OverwriteFile) {
     ASSERT_EQ(core.getDirectoryTree()->children.size(), 1) << "Overwriting should not increase child count";
     EXPECT_EQ(core.getDirectoryTree()->children.first()->size, 22) << "File size should be updated after overwrite";
 }
+
+TEST_F(ISOCoreTest, ImportDirectory) {
+    QTemporaryDir tempDir;
+    ASSERT_TRUE(tempDir.isValid());
+
+    // Create a nested structure
+    QDir(tempDir.path()).mkdir("SUBDIR");
+    QFile file1(tempDir.filePath("file1.txt"));
+    ASSERT_TRUE(file1.open(QIODevice::WriteOnly));
+    file1.write("file1");
+    file1.close();
+    QFile file2(tempDir.filePath("SUBDIR/file2.txt"));
+    ASSERT_TRUE(file2.open(QIODevice::WriteOnly));
+    file2.write("file2");
+    file2.close();
+
+    // Import the directory
+    core.importDirectory(tempDir.path(), core.getDirectoryTree());
+
+    // Assert the structure
+    ASSERT_EQ(core.getDirectoryTree()->children.size(), 1);
+    const IsoNode* importedDir = core.getDirectoryTree()->children.first();
+    EXPECT_EQ(importedDir->name, QFileInfo(tempDir.path()).fileName());
+    ASSERT_EQ(importedDir->children.size(), 2);
+
+    const IsoNode* importedFile1 = nullptr;
+    const IsoNode* importedSubDir = nullptr;
+    for (const auto* child : importedDir->children) {
+        if (child->name == "file1.txt") importedFile1 = child;
+        if (child->name == "SUBDIR") importedSubDir = child;
+    }
+
+    ASSERT_NE(importedFile1, nullptr);
+    ASSERT_NE(importedSubDir, nullptr);
+
+    EXPECT_FALSE(importedFile1->isDirectory);
+    EXPECT_TRUE(importedSubDir->isDirectory);
+
+    ASSERT_EQ(importedSubDir->children.size(), 1);
+    const IsoNode* importedFile2 = importedSubDir->children.first();
+    ASSERT_NE(importedFile2, nullptr);
+    EXPECT_EQ(importedFile2->name, "file2.txt");
+}
