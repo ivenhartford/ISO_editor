@@ -19,15 +19,16 @@
 #include <QTreeWidgetItem>
 #include <QHeaderView>
 #include <QFileInfo>
+#include <QToolBar>
 
 ISOEditor::ISOEditor(QWidget *parent)
     : QMainWindow(parent), m_isCueSheetLoaded(false)
 {
     setWindowTitle("ISO Editor");
-    setGeometry(100, 100, 800, 600);
 
     createActions();
     createMenus();
+    createToolBar();
     createMainInterface();
     createStatusBar();
 
@@ -46,19 +47,23 @@ ISOEditor::ISOEditor(QWidget *parent)
     refreshView();
 }
 
+#include <QIcon>
+
+// ...
+
 void ISOEditor::createActions()
 {
-    newAction = new QAction("&New ISO...", this);
-    openAction = new QAction("&Open ISO...", this);
-    saveAction = new QAction("&Save ISO", this);
-    saveAsAction = new QAction("Save ISO &As...", this);
-    exitAction = new QAction("E&xit", this);
-    addFileAction = new QAction("Add &File...", this);
-    addFolderAction = new QAction("Add F&older...", this);
-    importDirAction = new QAction("&Import Directory...", this);
-    removeAction = new QAction("&Remove Selected", this);
-    propertiesAction = new QAction("ISO &Properties...", this);
-    refreshAction = new QAction("&Refresh", this);
+    newAction = new QAction(QIcon::fromTheme("document-new"), "&New ISO...", this);
+    openAction = new QAction(QIcon::fromTheme("document-open"), "&Open ISO...", this);
+    saveAction = new QAction(QIcon::fromTheme("document-save"), "&Save ISO", this);
+    saveAsAction = new QAction(QIcon::fromTheme("document-save-as"), "Save ISO &As...", this);
+    exitAction = new QAction(QIcon::fromTheme("application-exit"), "E&xit", this);
+    addFileAction = new QAction(QIcon::fromTheme("list-add"), "Add &File...", this);
+    addFolderAction = new QAction(QIcon::fromTheme("folder-add"), "Add F&older...", this);
+    importDirAction = new QAction(QIcon::fromTheme("folder-open"), "&Import Directory...", this);
+    removeAction = new QAction(QIcon::fromTheme("list-remove"), "&Remove Selected", this);
+    propertiesAction = new QAction(QIcon::fromTheme("document-properties"), "ISO &Properties...", this);
+    refreshAction = new QAction(QIcon::fromTheme("view-refresh"), "&Refresh", this);
 }
 
 void ISOEditor::createMenus()
@@ -81,6 +86,18 @@ void ISOEditor::createMenus()
     editMenu->addAction(propertiesAction);
     viewMenu = menuBar()->addMenu("&View");
     viewMenu->addAction(refreshAction);
+}
+
+void ISOEditor::createToolBar()
+{
+    fileToolBar = addToolBar("File");
+    fileToolBar->addAction(newAction);
+    fileToolBar->addAction(openAction);
+    fileToolBar->addAction(saveAction);
+    fileToolBar->addSeparator();
+    fileToolBar->addAction(addFileAction);
+    fileToolBar->addAction(addFolderAction);
+    fileToolBar->addAction(removeAction);
 }
 
 void ISOEditor::createMainInterface()
@@ -106,7 +123,8 @@ void ISOEditor::createMainInterface()
     isoContentsTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     rightLayout->addWidget(isoContentsTree);
     mainSplitter->addWidget(rightPane);
-    mainSplitter->setSizes({250, 550});
+    mainSplitter->setStretchFactor(0, 1);
+    mainSplitter->setStretchFactor(1, 3);
     mainLayout->addWidget(mainSplitter);
 }
 

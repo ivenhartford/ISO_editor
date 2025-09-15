@@ -5,6 +5,7 @@ project(ISO_Editor CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 # --- Find Packages ---
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
@@ -63,6 +64,7 @@ add_executable(iso_editor
     src/droppable_tree_widget.cpp
     src/logging_utils.cpp
     src/worker.cpp
+    src/iso_editor.qrc
 )
 target_link_libraries(iso_editor PRIVATE
     Qt6::Widgets
