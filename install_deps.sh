@@ -1,17 +1,23 @@
 #!/bin/bash
 set -e
 
-# Update package lists
-sudo apt-get update
+# This script detects the Linux distribution and installs the required dependencies.
 
-# Install dependencies, including the C++ compiler, CMake, and Qt.
-
-sudo apt-get install -y \
-    build-essential \
-    cmake \
-    pkg-config \
-    qt6-base-dev \
-    libcdio++-dev \
-    libiso9660++-dev
-
-echo "Dependencies installed successfully."
+if [ -f /etc/debian_version ]; then
+    echo "Debian-based system detected. Installing dependencies..."
+    sudo apt-get update
+    sudo apt-get install -y \
+        build-essential \
+        cmake \
+        pkg-config \
+        qt6-base-dev \
+        libcdio++-dev \
+        libiso9660-dev
+    echo "Dependencies installed successfully."
+elif [ -f /etc/redhat-release ]; then
+    echo "RHEL-based system detected."
+    ./install_deps-rhel.sh
+else
+    echo "Unsupported Linux distribution."
+    exit 1
+fi
