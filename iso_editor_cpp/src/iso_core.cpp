@@ -19,7 +19,6 @@ static bool writeTreeToDisk(const ISOCore* core, const IsoNode* node, const QStr
 static void importDirectoryRecursive(ISOCore* core, const QString& sourcePath, IsoNode* targetParentNode);
 static void buildNodeTree(ISO9660::IFS &fs, const std::string& path, IsoNode* parent_node);
 
-
 // --- ISOCore Implementation ---
 
 ISOCore::ISOCore() {
@@ -44,6 +43,7 @@ void ISOCore::clear() {
 
 void ISOCore::initNewIso() {
     clear();
+    qInfo() << "Initializing new empty ISO structure.";
     rootNode = new IsoNode();
     rootNode->name = "/";
     rootNode->isDirectory = true;
@@ -51,13 +51,15 @@ void ISOCore::initNewIso() {
     rootNode->date = QDateTime::currentDateTime();
     rootNode->isNew = true;
     volumeDescriptor.volumeId = "NEW_ISO";
+    volumeDescriptor.systemId = "ISO_EDITOR";
     modified = false;
 }
 
 bool ISOCore::loadCueSheet(const QString &filePath) {
+    qInfo() << "Attempting to load CUE sheet from" << filePath;
     QFile cueFile(filePath);
     if (!cueFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "Failed to open CUE file:" << filePath;
+        qCritical() << "Failed to open CUE file:" << filePath;
         return false;
     }
     QTextStream in(&cueFile);
@@ -101,6 +103,7 @@ bool ISOCore::loadCueSheet(const QString &filePath) {
     }
     currentIsoPath = filePath;
     modified = false;
+    qInfo() << "Successfully loaded CUE sheet" << filePath;
     return true;
 }
 
@@ -109,10 +112,11 @@ bool ISOCore::loadIso(const QString &filePath) {
     if (fileInfo.suffix().compare("cue", Qt::CaseInsensitive) == 0) {
         return loadCueSheet(filePath);
     }
+    qInfo() << "Attempting to load ISO image from" << filePath;
     initNewIso();
     ISO9660::IFS fs;
     if (!fs.open(filePath.toStdString().c_str(), ISO_EXTENSION_ALL)) {
-        qWarning() << "Failed to open ISO:" << filePath;
+        qCritical() << "Failed to open ISO:" << filePath;
         initNewIso();
         return false;
     }
@@ -131,6 +135,7 @@ bool ISOCore::loadIso(const QString &filePath) {
     currentIsoPath = filePath;
     modified = false;
     rootNode->isNew = false;
+    qInfo() << "Successfully loaded ISO image" << filePath;
     return true;
 }
 
@@ -140,7 +145,7 @@ QByteArray ISOCore::getFileData(const IsoNode* node) const {
     if (node->isCueTrack) {
         QFile binFile(node->cueBinFile);
         if (!binFile.open(QIODevice::ReadOnly)) {
-            qWarning() << "Could not open BIN file:" << node->cueBinFile;
+            qWarning() << "Could not open BIN file for CUE track:" << node->cueBinFile;
             return QByteArray();
         }
         binFile.seek(node->cueOffset);
@@ -148,7 +153,10 @@ QByteArray ISOCore::getFileData(const IsoNode* node) const {
     }
     if (currentIsoPath.isEmpty()) return QByteArray();
     iso9660_t* p_iso = iso9660_open(currentIsoPath.toStdString().c_str());
-    if (!p_iso) return QByteArray();
+    if (!p_iso) {
+        qWarning() << "Could not open ISO file to get file data:" << currentIsoPath;
+        return QByteArray();
+    }
     QByteArray buffer;
     buffer.resize(node->size);
     long int blocks = node->size / ISO_BLOCKSIZE + (node->size % ISO_BLOCKSIZE > 0);
@@ -159,9 +167,16 @@ QByteArray ISOCore::getFileData(const IsoNode* node) const {
 }
 
 bool ISOCore::saveIso(const QString &filePath, bool useUdf, bool makeHybrid) {
+    qInfo() << "Saving ISO to" << filePath << "with UDF:" << useUdf << "Hybrid:" << makeHybrid;
     QTemporaryDir tempDir;
-    if (!tempDir.isValid()) return false;
-    if (!writeTreeToDisk(this, rootNode, tempDir.path())) return false;
+    if (!tempDir.isValid()) {
+        qCritical() << "Failed to create temporary directory for saving ISO.";
+        return false;
+    }
+    if (!writeTreeToDisk(this, rootNode, tempDir.path())) {
+        qCritical() << "Failed to write ISO contents to temporary directory.";
+        return false;
+    }
     QStringList args;
     args << "-o" << filePath << "-R" << "-J" << "-V" << volumeDescriptor.volumeId << "-sysid" << volumeDescriptor.systemId;
     if (useUdf) args << "-udf";
@@ -184,9 +199,11 @@ bool ISOCore::saveIso(const QString &filePath, bool useUdf, bool makeHybrid) {
     QProcess genisoimage;
     genisoimage.start("genisoimage", args);
     if (!genisoimage.waitForFinished(-1) || genisoimage.exitCode() != 0) {
-        qWarning() << "genisoimage failed:" << genisoimage.readAllStandardError();
+        qCritical() << "genisoimage process failed. Exit code:" << genisoimage.exitCode()
+                   << "Error:" << genisoimage.readAllStandardError();
         return false;
     }
+    qInfo() << "Successfully saved ISO to" << filePath;
     modified = false;
     currentIsoPath = filePath;
     return true;
@@ -196,6 +213,7 @@ void ISOCore::importDirectory(const QString &dirPath, IsoNode *targetNode) {
     if (!targetNode || !targetNode->isDirectory) return;
     QFileInfo dirInfo(dirPath);
     if (!dirInfo.isDir()) return;
+    qInfo() << "Importing directory" << dirPath << "to" << targetNode->name;
     importDirectoryRecursive(this, dirPath, targetNode);
     modified = true;
 }
@@ -203,7 +221,10 @@ void ISOCore::importDirectory(const QString &dirPath, IsoNode *targetNode) {
 void ISOCore::addFileToDirectory(const QString &filePath, IsoNode *targetNode) {
     if (!targetNode || !targetNode->isDirectory) return;
     QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) return;
+    if (!file.open(QIODevice::ReadOnly)) {
+        qWarning() << "Could not open file for reading:" << filePath;
+        return;
+    }
     QByteArray fileData = file.readAll();
     QFileInfo fileInfo(filePath);
     QString filename = fileInfo.fileName();
@@ -227,8 +248,12 @@ void ISOCore::addFileToDirectory(const QString &filePath, IsoNode *targetNode) {
 void ISOCore::addFolderToDirectory(const QString &folderName, IsoNode *targetNode) {
     if (!targetNode || !targetNode->isDirectory) return;
     for (const IsoNode* child : targetNode->children) {
-        if (child->isDirectory && child->name.compare(folderName, Qt::CaseInsensitive) == 0) return;
+        if (child->isDirectory && child->name.compare(folderName, Qt::CaseInsensitive) == 0) {
+            qInfo() << "Folder" << folderName << "already exists. Skipping.";
+            return;
+        }
     }
+    qInfo() << "Adding folder" << folderName << "to node" << targetNode->name;
     IsoNode* newNode = new IsoNode();
     newNode->name = folderName;
     newNode->isDirectory = true;
@@ -241,13 +266,13 @@ void ISOCore::addFolderToDirectory(const QString &folderName, IsoNode *targetNod
 
 void ISOCore::removeNode(IsoNode *node) {
     if (!node || !node->parent || node == rootNode) return;
+    qInfo() << "Removing node" << node->name;
     if (node->parent->children.removeOne(node)) {
         delete node;
         modified = true;
     }
 }
 
-// Getters and Setters
 const IsoNode* ISOCore::getDirectoryTree() const { return rootNode; }
 IsoNode* ISOCore::getDirectoryTree() { return rootNode; }
 const VolumeDescriptor& ISOCore::getVolumeDescriptor() const { return volumeDescriptor; }
@@ -258,9 +283,6 @@ QString ISOCore::getCurrentPath() const { return currentIsoPath; }
 void ISOCore::setVolumeDescriptor(const VolumeDescriptor& vd) { if (volumeDescriptor.volumeId != vd.volumeId || volumeDescriptor.systemId != vd.systemId) { volumeDescriptor = vd; modified = true; } }
 void ISOCore::setBootImagePath(const QString& path) { if (bootImagePath != path) { bootImagePath = path; modified = true; } }
 void ISOCore::setEfiBootImagePath(const QString& path) { if (efiBootImagePath != path) { efiBootImagePath = path; modified = true; } }
-
-
-// --- Static Helper Implementations ---
 
 static void buildNodeTree(ISO9660::IFS &fs, const std::string& path, IsoNode* parent_node) {
     stat_vector_t stat_vector;
@@ -299,9 +321,15 @@ static bool writeTreeToDisk(const ISOCore* core, const IsoNode* node, const QStr
             if (!QDir(currentPath).mkdir(child->name) || !writeTreeToDisk(core, child, childPath)) return false;
         } else {
             QFile file(childPath);
-            if (!file.open(QIODevice::WriteOnly)) return false;
+            if (!file.open(QIODevice::WriteOnly)) {
+                qWarning() << "Failed to open file for writing" << childPath;
+                return false;
+            }
             QByteArray data = core->getFileData(child);
-            if (file.write(data) != data.size()) return false;
+            if (file.write(data) != data.size()) {
+                qWarning() << "Failed to write all data to file" << childPath;
+                return false;
+            }
         }
     }
     return true;

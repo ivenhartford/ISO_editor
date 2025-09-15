@@ -20,9 +20,8 @@
 #include <QHeaderView>
 #include <QFileInfo>
 
-
 ISOEditor::ISOEditor(QWidget *parent)
-    : QMainWindow(parent)
+    : QMainWindow(parent), m_isCueSheetLoaded(false)
 {
     setWindowTitle("ISO Editor");
     setGeometry(100, 100, 800, 600);
@@ -42,6 +41,7 @@ ISOEditor::ISOEditor(QWidget *parent)
     connect(propertiesAction, &QAction::triggered, this, &ISOEditor::showIsoProperties);
     connect(exitAction, &QAction::triggered, this, &ISOEditor::close);
     connect(isoContentsTree, &DroppableTreeWidget::filesDropped, this, &ISOEditor::handleDrop);
+    connect(refreshAction, &QAction::triggered, this, &ISOEditor::refreshView);
 
     refreshView();
 }
@@ -59,7 +59,6 @@ void ISOEditor::createActions()
     removeAction = new QAction("&Remove Selected", this);
     propertiesAction = new QAction("ISO &Properties...", this);
     refreshAction = new QAction("&Refresh", this);
-    connect(refreshAction, &QAction::triggered, this, &ISOEditor::refreshView);
 }
 
 void ISOEditor::createMenus()
@@ -72,7 +71,6 @@ void ISOEditor::createMenus()
     fileMenu->addAction(saveAsAction);
     fileMenu->addSeparator();
     fileMenu->addAction(exitAction);
-
     editMenu = menuBar()->addMenu("&Edit");
     editMenu->addAction(addFileAction);
     editMenu->addAction(addFolderAction);
@@ -81,7 +79,6 @@ void ISOEditor::createMenus()
     editMenu->addAction(removeAction);
     editMenu->addSeparator();
     editMenu->addAction(propertiesAction);
-
     viewMenu = menuBar()->addMenu("&View");
     viewMenu->addAction(refreshAction);
 }
@@ -113,9 +110,16 @@ void ISOEditor::createMainInterface()
     mainLayout->addWidget(mainSplitter);
 }
 
-void ISOEditor::createStatusBar()
-{
-    mainStatusBar = statusBar();
+void ISOEditor::createStatusBar() { mainStatusBar = statusBar(); }
+
+void ISOEditor::updateActions() {
+    saveAction->setEnabled(!m_isCueSheetLoaded);
+    saveAsAction->setEnabled(!m_isCueSheetLoaded);
+    addFileAction->setEnabled(true);
+    addFolderAction->setEnabled(true);
+    removeAction->setEnabled(true);
+    propertiesAction->setEnabled(true);
+    importDirAction->setEnabled(true);
 }
 
 void ISOEditor::refreshView()
@@ -133,10 +137,10 @@ void ISOEditor::refreshView()
     volumeNameLabel->setText(QString("Volume Name: %1").arg(vd.volumeId));
     isoInfoLabel->setText(QString("System ID: %1").arg(vd.systemId));
     mainStatusBar->showMessage(m_core.isModified() ? "Modified" : "Ready");
+    updateActions();
 }
 
-void ISOEditor::populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNode)
-{
+void ISOEditor::populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNode) {
     for (IsoNode* childNode : parentNode->children) {
         QStringList rowData;
         rowData << childNode->name;
@@ -153,29 +157,32 @@ void ISOEditor::populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNod
     }
 }
 
-IsoNode* ISOEditor::getSelectedNode()
-{
+IsoNode* ISOEditor::getSelectedNode() {
     QList<QTreeWidgetItem*> selectedItems = isoContentsTree->selectedItems();
     if (selectedItems.isEmpty()) return m_core.getDirectoryTree();
     return m_treeItemMap.value(selectedItems.first(), m_core.getDirectoryTree());
 }
 
-void ISOEditor::newIso() { m_core.initNewIso(); refreshView(); }
+void ISOEditor::newIso() {
+    m_core.initNewIso();
+    m_isCueSheetLoaded = false;
+    refreshView();
+}
 
-void ISOEditor::openIso()
-{
+void ISOEditor::openIso() {
     QString filePath = QFileDialog::getOpenFileName(this, "Open Image", "", "Disc Images (*.iso *.cue);;All Files (*)");
     if (!filePath.isEmpty()) {
         if (m_core.loadIso(filePath)) {
+            QFileInfo info(filePath);
+            m_isCueSheetLoaded = (info.suffix().compare("cue", Qt::CaseInsensitive) == 0);
             refreshView();
         } else {
-            QMessageBox::critical(this, "Error", "Failed to load the selected ISO image.");
+            QMessageBox::critical(this, "Error", "Failed to load the selected image.");
         }
     }
 }
 
-void ISOEditor::addFolder()
-{
+void ISOEditor::addFolder() {
     IsoNode* targetNode = getSelectedNode();
     if (!targetNode->isDirectory) targetNode = targetNode->parent;
     bool ok;
@@ -186,8 +193,7 @@ void ISOEditor::addFolder()
     }
 }
 
-void ISOEditor::addFile()
-{
+void ISOEditor::addFile() {
     IsoNode* targetNode = getSelectedNode();
     if (!targetNode->isDirectory) targetNode = targetNode->parent;
     QStringList filePaths = QFileDialog::getOpenFileNames(this, "Add Files");
@@ -199,8 +205,7 @@ void ISOEditor::addFile()
     }
 }
 
-void ISOEditor::removeSelected()
-{
+void ISOEditor::removeSelected() {
     IsoNode* nodeToRemove = getSelectedNode();
     if (!nodeToRemove || nodeToRemove == m_core.getDirectoryTree()) return;
     QMessageBox::StandardButton reply = QMessageBox::question(this, "Confirm Removal", QString("Are you sure you want to remove '%1'?").arg(nodeToRemove->name), QMessageBox::Yes|QMessageBox::No);
@@ -210,12 +215,11 @@ void ISOEditor::removeSelected()
     }
 }
 
-void ISOEditor::saveIso()
-{
+void ISOEditor::saveIso() {
     if (m_core.getCurrentPath().isEmpty()) {
         saveIsoAs();
     } else {
-        if (!m_core.saveIso(m_core.getCurrentPath(), true, false)) {
+        if (!m_core.saveIso(m_core.getCurrentPath(), true, false)) { // Default options for save
             QMessageBox::critical(this, "Error", "Failed to save the ISO image.");
         } else {
             QMessageBox::information(this, "Success", "ISO saved successfully.");
@@ -224,8 +228,7 @@ void ISOEditor::saveIso()
     }
 }
 
-void ISOEditor::saveIsoAs()
-{
+void ISOEditor::saveIsoAs() {
     SaveAsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         SaveOptions options = dialog.getOptions();
@@ -239,8 +242,7 @@ void ISOEditor::saveIsoAs()
     }
 }
 
-void ISOEditor::showIsoProperties()
-{
+void ISOEditor::showIsoProperties() {
     const VolumeDescriptor& vd = m_core.getVolumeDescriptor();
     IsoProperties props = { vd.volumeId, vd.systemId, m_core.getBootImagePath(), m_core.getEfiBootImagePath() };
     PropertiesDialog dialog(props, this);
@@ -254,8 +256,7 @@ void ISOEditor::showIsoProperties()
     }
 }
 
-void ISOEditor::handleDrop(const QStringList &filePaths)
-{
+void ISOEditor::handleDrop(const QStringList &filePaths) {
     IsoNode* targetNode = getSelectedNode();
     if (!targetNode->isDirectory) targetNode = targetNode->parent;
     for (const QString& path : filePaths) {

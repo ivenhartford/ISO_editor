@@ -61,6 +61,8 @@ add_executable(iso_editor
     src/save_as_dialog.cpp
     src/properties_dialog.cpp
     src/droppable_tree_widget.cpp
+    src/logging_utils.cpp
+    src/worker.cpp
 )
 target_link_libraries(iso_editor PRIVATE
     Qt6::Widgets

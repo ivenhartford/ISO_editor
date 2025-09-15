@@ -2,11 +2,11 @@
 #define ISOEDITOR_H
 
 #include <QMainWindow>
+#include <QTreeWidget>
 #include <QMap>
 #include "iso_core.h"
-#include "droppable_tree_widget.h" // Include the custom widget header
+#include "droppable_tree_widget.h"
 
-// Forward declarations
 class QAction;
 class QLabel;
 class QMenu;
@@ -21,7 +21,6 @@ public:
     explicit ISOEditor(QWidget *parent = nullptr);
 
 private slots:
-    // Menu actions
     void newIso();
     void openIso();
     void addFolder();
@@ -30,12 +29,9 @@ private slots:
     void saveIso();
     void saveIsoAs();
     void showIsoProperties();
-
-    // Other UI slots
     void handleDrop(const QStringList &filePaths);
 
 private:
-    // UI setup
     void createActions();
     void createMenus();
     void createMainInterface();
@@ -44,23 +40,19 @@ private:
     void populateTreeNode(QTreeWidgetItem *parentItem, IsoNode *parentNode);
     IsoNode* getSelectedNode();
 
-    // Core logic handler
     ISOCore m_core;
+    bool m_isCueSheetLoaded;
+    void updateActions();
 
-    // Map to link UI items to core data nodes
     QMap<QTreeWidgetItem*, IsoNode*> m_treeItemMap;
 
-    // UI Widgets
     DroppableTreeWidget *isoContentsTree;
     QLabel *isoInfoLabel;
     QLabel *volumeNameLabel;
     QSplitter *mainSplitter;
     QStatusBar *mainStatusBar;
 
-    // Menus & Actions
-    QMenu *fileMenu;
-    QMenu *editMenu;
-    QMenu *viewMenu;
+    QMenu *fileMenu, *editMenu, *viewMenu;
     QAction *newAction, *openAction, *saveAction, *saveAsAction, *exitAction;
     QAction *addFileAction, *addFolderAction, *importDirAction, *removeAction;
     QAction *propertiesAction, *refreshAction;
