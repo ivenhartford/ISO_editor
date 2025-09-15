@@ -20,11 +20,11 @@ pacman -S --noconfirm \
     mingw-w64-x86_64-toolchain \
     mingw-w64-x86_64-cmake \
     mingw-w64-x86_64-qt6 \
-    mingw-w64-x86_64-libcdio \
-    mingw-w64-x86_64-libiso9660
+    mingw-w64-x86_64-libcdio
 ```
 
-This will install the C++ compiler, CMake, Qt6, libcdio, and libiso9660.
+This will install the C++ compiler (as part of the `toolchain`), CMake, Qt6, and the required C++ libraries.
+
 
 ## 3. Build the Application
 

@@ -4,7 +4,8 @@ set -e
 # Update package lists
 sudo apt-get update
 
-# Install dependencies
+# Install dependencies, including the C++ compiler, CMake, and Qt.
+
 sudo apt-get install -y \
     build-essential \
     cmake \
