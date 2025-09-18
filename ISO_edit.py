@@ -1,11 +1,15 @@
+import hashlib
 import sys
 import logging
+import glob
+import subprocess
+import re
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
     QFileDialog, QMessageBox, QInputDialog, QSplitter, QGroupBox,
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton,
-    QProgressDialog, QCheckBox
+    QProgressDialog, QCheckBox, QComboBox
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QPoint, Signal, QThread
@@ -14,6 +18,8 @@ import traceback
 from iso_logic import ISOCore
 
 logger = logging.getLogger(__name__)
+
+IS_LINUX = sys.platform.startswith('linux')
 
 class DroppableTreeWidget(QTreeWidget):
     """
@@ -98,6 +104,10 @@ class SaveAsDialog(QDialog):
         self.hybrid_checkbox.setChecked(False)
         form_layout.addRow(self.hybrid_checkbox)
 
+        self.checksum_checkbox = QCheckBox("Verify checksums after saving")
+        self.checksum_checkbox.setChecked(True)
+        form_layout.addRow(self.checksum_checkbox)
+
         self.layout.addLayout(form_layout)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
@@ -114,44 +124,56 @@ class SaveAsDialog(QDialog):
         return {
             'file_path': self.file_path_edit.text(),
             'use_udf': self.udf_checkbox.isChecked(),
-            'make_hybrid': self.hybrid_checkbox.isChecked()
+            'make_hybrid': self.hybrid_checkbox.isChecked(),
+            'calculate_checksums': self.checksum_checkbox.isChecked()
         }
 
 class PropertiesDialog(QDialog):
     """
     A dialog for editing ISO properties, such as volume ID and boot options.
     """
-    def __init__(self, parent, volume_descriptor, boot_image_path, efi_boot_image_path):
+    def __init__(self, parent, core):
         """
         Initializes the PropertiesDialog.
-
         Args:
             parent (QWidget): The parent widget.
-            volume_descriptor (dict): The current volume descriptor of the ISO.
-            boot_image_path (str): The path to the BIOS boot image.
-            efi_boot_image_path (str): The path to the EFI boot image.
+            core (ISOCore): The ISOCore instance.
         """
         super().__init__(parent)
         self.setWindowTitle("ISO Properties")
-
-        self.layout = QFormLayout(self)
+        self.layout = QVBoxLayout(self)
 
         # Volume Properties
         volume_group = QGroupBox("Volume Properties")
         volume_layout = QFormLayout()
-        self.volume_id_edit = QLineEdit(volume_descriptor.get('volume_id', ''))
-        self.system_id_edit = QLineEdit(volume_descriptor.get('system_id', ''))
+        self.volume_id_edit = QLineEdit(core.volume_descriptor.get('volume_id', ''))
+        self.system_id_edit = QLineEdit(core.volume_descriptor.get('system_id', ''))
         volume_layout.addRow("Volume ID:", self.volume_id_edit)
         volume_layout.addRow("System ID:", self.system_id_edit)
         volume_group.setLayout(volume_layout)
         self.layout.addWidget(volume_group)
 
-        # Boot Properties
+        # Detected Boot Info (Read-only)
+        if core.extracted_boot_info:
+            detected_boot_group = QGroupBox("Detected Boot Information")
+            detected_boot_layout = QFormLayout()
+            # Display info for the first boot entry found
+            boot_info = core.extracted_boot_info[0]
+            platform_map = {0: "x86", 1: "PowerPC", 2: "Mac", 0xef: "EFI"}
+            platform_str = platform_map.get(boot_info.get('platform_id'), 'Unknown')
+
+            detected_boot_layout.addRow(QLabel("Platform:"), QLabel(platform_str))
+            detected_boot_layout.addRow(QLabel("Emulation:"), QLabel(boot_info.get('emulation_type', 'N/A')))
+            detected_boot_layout.addRow(QLabel("Boot Image:"), QLabel(boot_info.get('boot_image_path', 'N/A')))
+            detected_boot_group.setLayout(detected_boot_layout)
+            self.layout.addWidget(detected_boot_group)
+
+        # Boot Options (Editable)
         boot_group = QGroupBox("Boot Options")
         boot_form_layout = QFormLayout()
 
         # BIOS Boot Image
-        self.boot_image_edit = QLineEdit(boot_image_path or '')
+        self.boot_image_edit = QLineEdit(core.boot_image_path or '')
         bios_browse_button = QPushButton("Browse...")
         bios_browse_button.clicked.connect(lambda: self.browse_for_image(self.boot_image_edit, "Select BIOS Boot Image"))
         bios_boot_layout = QHBoxLayout()
@@ -159,8 +181,15 @@ class PropertiesDialog(QDialog):
         bios_boot_layout.addWidget(bios_browse_button)
         boot_form_layout.addRow("BIOS Boot Image:", bios_boot_layout)
 
+        # Emulation Type
+        self.emulation_combo = QComboBox()
+        self.emulation_combo.addItems(['noemul', 'floppy', 'hdemul'])
+        current_emulation = core.boot_emulation_type or 'noemul'
+        self.emulation_combo.setCurrentText(current_emulation)
+        boot_form_layout.addRow("Emulation Type:", self.emulation_combo)
+
         # EFI Boot Image
-        self.efi_boot_image_edit = QLineEdit(efi_boot_image_path or '')
+        self.efi_boot_image_edit = QLineEdit(core.efi_boot_image_path or '')
         efi_browse_button = QPushButton("Browse...")
         efi_browse_button.clicked.connect(lambda: self.browse_for_image(self.efi_boot_image_edit, "Select EFI Boot Image"))
         efi_boot_layout = QHBoxLayout()
@@ -178,30 +207,81 @@ class PropertiesDialog(QDialog):
         self.layout.addWidget(self.buttons)
 
     def browse_for_image(self, line_edit, title):
-        """
-        Opens a file dialog to browse for a boot image.
-
-        Args:
-            line_edit (QLineEdit): The line edit to set the file path in.
-            title (str): The title of the file dialog.
-        """
         file_path, _ = QFileDialog.getOpenFileName(self, title, "", "Boot Images (*.img *.bin);;All Files (*)")
         if file_path:
             line_edit.setText(file_path)
 
     def get_properties(self):
-        """
-        Gets the updated properties from the dialog.
-
-        Returns:
-            dict: A dictionary of the updated properties.
-        """
         return {
             'volume_id': self.volume_id_edit.text(),
             'system_id': self.system_id_edit.text(),
             'boot_image_path': self.boot_image_edit.text(),
-            'efi_boot_image_path': self.efi_boot_image_edit.text()
+            'efi_boot_image_path': self.efi_boot_image_edit.text(),
+            'boot_emulation_type': self.emulation_combo.currentText()
         }
+
+
+class RipDiscDialog(QDialog):
+    """
+    A dialog for setting up a disc ripping operation.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create ISO from Disc")
+        self.layout = QFormLayout(self)
+
+        # Drive selection
+        self.drive_combo = QComboBox()
+        self.populate_drives()
+        self.layout.addRow("Optical Drive:", self.drive_combo)
+
+        # Output file
+        self.output_path_edit = QLineEdit()
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse_output)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_path_edit)
+        output_layout.addWidget(browse_button)
+        self.layout.addRow("Output File:", output_layout)
+
+        # Dialog buttons
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Start Ripping")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addWidget(self.buttons)
+
+    def populate_drives(self):
+        """
+        Scans for optical drives and populates the combo box.
+        """
+        # A simple way to find drives on Linux
+        drives = sorted(glob.glob('/dev/sr[0-9]*'))
+        if drives:
+            self.drive_combo.addItems(drives)
+        else:
+            self.drive_combo.addItem("No drives found")
+            self.drive_combo.setEnabled(False)
+
+    def browse_output(self):
+        """
+        Opens a file dialog to select the output ISO file.
+        """
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        if file_path:
+            self.output_path_edit.setText(file_path)
+
+    def get_rip_options(self):
+        """
+        Gets the selected options from the dialog.
+        """
+        if not self.drive_combo.isEnabled():
+            return None
+        return {
+            'drive': self.drive_combo.currentText(),
+            'output_path': self.output_path_edit.text()
+        }
+
 
 class ISOEditor(QMainWindow):
     """
@@ -235,6 +315,11 @@ class ISOEditor(QMainWindow):
         open_action = QAction("&Open ISO...", self)
         open_action.triggered.connect(self.open_iso)
         file_menu.addAction(open_action)
+
+        if IS_LINUX:
+            rip_disc_action = QAction("Create ISO from &Disc...", self)
+            rip_disc_action.triggered.connect(self.rip_disc)
+            file_menu.addAction(rip_disc_action)
 
         file_menu.addSeparator()
 
@@ -384,7 +469,8 @@ class ISOEditor(QMainWindow):
         if not self.core.current_iso_path:
             self.save_iso_as()
         else:
-            self._perform_save(self.core.current_iso_path)
+            # When re-saving, we don't show the options dialog, so we use default values.
+            self._perform_save(self.core.current_iso_path, use_udf=True, make_hybrid=False, calculate_checksums=False)
 
     def save_iso_as(self):
         """Saves the current ISO to a new path."""
@@ -393,22 +479,23 @@ class ISOEditor(QMainWindow):
         if dialog.exec():
             options = dialog.get_options()
             if options['file_path']:
-                self._perform_save(options['file_path'], options['use_udf'], options['make_hybrid'])
+                self._perform_save(
+                    options['file_path'],
+                    options['use_udf'],
+                    options['make_hybrid'],
+                    options['calculate_checksums']
+                )
             else:
                 logger.info("Save As dialog cancelled.")
         else:
             logger.info("Save As dialog cancelled.")
 
-    def _perform_save(self, file_path, use_udf, make_hybrid):
+    def _perform_save(self, file_path, use_udf, make_hybrid, calculate_checksums=False):
         """
         Performs the save operation, including filename validation.
-
-        Args:
-            file_path (str): The path to save the ISO to.
-            use_udf (bool): Whether to use UDF.
-            make_hybrid (bool): Whether to make the ISO a hybrid ISO.
         """
         logger.info(f"Attempting to save ISO to {file_path}")
+        self.should_calculate_checksums = calculate_checksums
 
         # Validate filenames before saving
         non_compliant_files = self.core.find_non_compliant_filenames()
@@ -454,13 +541,72 @@ class ISOEditor(QMainWindow):
         self.refresh_view()
         self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
         logger.info(f"ISO saved successfully to {file_path}")
-        QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+
+        if self.should_calculate_checksums:
+            self.update_status(f"Saved. Now calculating checksums for {os.path.basename(file_path)}...")
+            self.checksum_thread = ChecksumWorker(file_path)
+            self.checksum_thread.finished.connect(self.checksum_finished)
+            self.checksum_thread.start()
+        else:
+            QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+
+    def checksum_finished(self, hashes, error_string):
+        if error_string:
+            QMessageBox.critical(self, "Error", error_string)
+            self.update_status("Error calculating checksums.")
+            return
+
+        checksum_text = (f"Checksums for {os.path.basename(self.core.current_iso_path)}:\n\n"
+                         f"MD5:    {hashes['md5']}\n"
+                         f"SHA-1:  {hashes['sha1']}\n"
+                         f"SHA-256: {hashes['sha256']}")
+
+        QMessageBox.information(self, "Checksums", checksum_text)
+        self.update_status("Checksum calculation complete.")
 
     def save_error(self, error_message):
         self.progress_dialog.close()
         logger.exception(f"An error occurred while saving the ISO: {error_message}")
         QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {error_message}")
         self.update_status("Error saving ISO.")
+
+    def rip_disc(self):
+        """
+        Shows the dialog for ripping a disc to an ISO file and starts the process.
+        """
+        logger.info("Rip Disc action triggered.")
+        dialog = RipDiscDialog(self)
+        if dialog.exec():
+            options = dialog.get_rip_options()
+            if not options or not options.get('drive') or not options.get('output_path'):
+                QMessageBox.warning(self, "Invalid Options", "Please select a valid drive and an output path.")
+                return
+
+            logger.info(f"Starting disc rip with options: {options}")
+
+            self.rip_progress_dialog = QProgressDialog("Ripping disc...", "Cancel", 0, 100, self)
+            self.rip_progress_dialog.setWindowModality(Qt.WindowModal)
+            self.rip_progress_dialog.setAutoClose(True)
+
+            self.rip_thread = RipDiscWorker(options['drive'], options['output_path'])
+            self.rip_thread.progress.connect(self.update_rip_progress)
+            self.rip_thread.finished.connect(self.rip_finished)
+            self.rip_progress_dialog.canceled.connect(self.rip_thread.stop) # Connect cancel button
+
+            self.rip_thread.start()
+            self.rip_progress_dialog.exec()
+
+    def update_rip_progress(self, value):
+        self.rip_progress_dialog.setValue(value)
+
+    def rip_finished(self, error_message):
+        self.rip_progress_dialog.setValue(100)
+        if error_message:
+            QMessageBox.critical(self, "Ripping Failed", error_message)
+            self.update_status("Disc ripping failed.")
+        else:
+            QMessageBox.information(self, "Success", "Disc has been successfully ripped to an ISO file.")
+            self.update_status("Disc ripping complete.")
 
 class SaveWorker(QThread):
     progress = Signal(int)
@@ -485,6 +631,99 @@ class SaveWorker(QThread):
             self.finished.emit(self.file_path)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class ChecksumWorker(QThread):
+    """
+    A QThread worker for calculating file checksums in the background.
+    """
+    # Signal -> dict: e.g., {'md5': '...', 'sha1': '...', 'sha256': '...'}
+    #           str:  Error message if something goes wrong.
+    finished = Signal(dict, str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        """
+        Calculates MD5, SHA1, and SHA256 hashes for the file.
+        """
+        try:
+            hashes = {'md5': hashlib.md5(), 'sha1': hashlib.sha1(), 'sha256': hashlib.sha256()}
+            with open(self.file_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    for h in hashes.values():
+                        h.update(chunk)
+
+            results = {name: h.hexdigest() for name, h in hashes.items()}
+            self.finished.emit(results, "")
+        except Exception as e:
+            logger.error(f"Checksum calculation failed for {self.file_path}: {e}")
+            self.finished.emit({}, f"Failed to calculate checksums: {e}")
+
+
+class RipDiscWorker(QThread):
+    """
+    A QThread worker for ripping a disc in the background using dd.
+    """
+    progress = Signal(int) # Percentage
+    finished = Signal(str) # Error message (if any)
+
+    def __init__(self, source_drive, dest_path):
+        super().__init__()
+        self.source_drive = source_drive
+        self.dest_path = dest_path
+        self._is_running = True
+
+    def run(self):
+        """
+        Executes the dd command to rip the disc.
+        """
+        command = [
+            'dd',
+            f'if={self.source_drive}',
+            f'of={self.dest_path}',
+            'bs=2048',
+            'status=progress'
+        ]
+
+        try:
+            process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+
+            # This is a simplification. A better implementation would get the disc size first.
+            DVD_SIZE_BYTES = 4.7 * 1024 * 1024 * 1024
+
+            while self._is_running and process.poll() is None:
+                line = process.stderr.readline()
+                if line:
+                    match = re.search(r'(\d+)\s+bytes', line)
+                    if match:
+                        bytes_copied = int(match.group(1))
+                        percent = int((bytes_copied / DVD_SIZE_BYTES) * 100)
+                        self.progress.emit(min(percent, 100))
+
+            if not self._is_running:
+                process.terminate()
+                self.finished.emit("Ripping cancelled by user.")
+                return
+
+            retcode = process.wait()
+            if retcode == 0:
+                self.progress.emit(100)
+                self.finished.emit("") # Success
+            else:
+                self.finished.emit(f"dd command failed with exit code {retcode}")
+
+        except FileNotFoundError:
+            self.finished.emit("Error: 'dd' command not found. Is it installed and in your PATH?")
+        except Exception as e:
+            logger.error(f"Disc ripping failed: {e}")
+            self.finished.emit(f"An unexpected error occurred: {e}")
+
+    def stop(self):
+        self._is_running = False
+
 
     def get_selected_node(self):
         """
@@ -755,7 +994,7 @@ class SaveWorker(QThread):
             QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
             return
 
-        dialog = PropertiesDialog(self, self.core.volume_descriptor, self.core.boot_image_path, self.core.efi_boot_image_path)
+        dialog = PropertiesDialog(self, self.core)
         if dialog.exec():
             new_props = dialog.get_properties()
             logger.info(f"ISO properties updated: {new_props}")
@@ -764,12 +1003,14 @@ class SaveWorker(QThread):
             if (self.core.volume_descriptor.get('volume_id') != new_props['volume_id'] or
                 self.core.volume_descriptor.get('system_id') != new_props['system_id'] or
                 self.core.boot_image_path != new_props['boot_image_path'] or
-                self.core.efi_boot_image_path != new_props['efi_boot_image_path']):
+                self.core.efi_boot_image_path != new_props['efi_boot_image_path'] or
+                self.core.boot_emulation_type != new_props['boot_emulation_type']):
 
                 self.core.volume_descriptor['volume_id'] = new_props['volume_id']
                 self.core.volume_descriptor['system_id'] = new_props['system_id']
                 self.core.boot_image_path = new_props['boot_image_path']
                 self.core.efi_boot_image_path = new_props['efi_boot_image_path']
+                self.core.boot_emulation_type = new_props['boot_emulation_type']
                 self.core.iso_modified = True
                 self.refresh_view()
 
