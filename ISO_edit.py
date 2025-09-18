@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
     QFileDialog, QMessageBox, QInputDialog, QSplitter, QGroupBox,
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton,
-    QProgressDialog, QCheckBox
+    QProgressDialog, QCheckBox, QComboBox
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QPoint, Signal, QThread
@@ -121,37 +121,48 @@ class PropertiesDialog(QDialog):
     """
     A dialog for editing ISO properties, such as volume ID and boot options.
     """
-    def __init__(self, parent, volume_descriptor, boot_image_path, efi_boot_image_path):
+    def __init__(self, parent, core):
         """
         Initializes the PropertiesDialog.
-
         Args:
             parent (QWidget): The parent widget.
-            volume_descriptor (dict): The current volume descriptor of the ISO.
-            boot_image_path (str): The path to the BIOS boot image.
-            efi_boot_image_path (str): The path to the EFI boot image.
+            core (ISOCore): The ISOCore instance.
         """
         super().__init__(parent)
         self.setWindowTitle("ISO Properties")
-
-        self.layout = QFormLayout(self)
+        self.layout = QVBoxLayout(self)
 
         # Volume Properties
         volume_group = QGroupBox("Volume Properties")
         volume_layout = QFormLayout()
-        self.volume_id_edit = QLineEdit(volume_descriptor.get('volume_id', ''))
-        self.system_id_edit = QLineEdit(volume_descriptor.get('system_id', ''))
+        self.volume_id_edit = QLineEdit(core.volume_descriptor.get('volume_id', ''))
+        self.system_id_edit = QLineEdit(core.volume_descriptor.get('system_id', ''))
         volume_layout.addRow("Volume ID:", self.volume_id_edit)
         volume_layout.addRow("System ID:", self.system_id_edit)
         volume_group.setLayout(volume_layout)
         self.layout.addWidget(volume_group)
 
-        # Boot Properties
+        # Detected Boot Info (Read-only)
+        if core.extracted_boot_info:
+            detected_boot_group = QGroupBox("Detected Boot Information")
+            detected_boot_layout = QFormLayout()
+            # Display info for the first boot entry found
+            boot_info = core.extracted_boot_info[0]
+            platform_map = {0: "x86", 1: "PowerPC", 2: "Mac", 0xef: "EFI"}
+            platform_str = platform_map.get(boot_info.get('platform_id'), 'Unknown')
+
+            detected_boot_layout.addRow(QLabel("Platform:"), QLabel(platform_str))
+            detected_boot_layout.addRow(QLabel("Emulation:"), QLabel(boot_info.get('emulation_type', 'N/A')))
+            detected_boot_layout.addRow(QLabel("Boot Image:"), QLabel(boot_info.get('boot_image_path', 'N/A')))
+            detected_boot_group.setLayout(detected_boot_layout)
+            self.layout.addWidget(detected_boot_group)
+
+        # Boot Options (Editable)
         boot_group = QGroupBox("Boot Options")
         boot_form_layout = QFormLayout()
 
         # BIOS Boot Image
-        self.boot_image_edit = QLineEdit(boot_image_path or '')
+        self.boot_image_edit = QLineEdit(core.boot_image_path or '')
         bios_browse_button = QPushButton("Browse...")
         bios_browse_button.clicked.connect(lambda: self.browse_for_image(self.boot_image_edit, "Select BIOS Boot Image"))
         bios_boot_layout = QHBoxLayout()
@@ -159,8 +170,15 @@ class PropertiesDialog(QDialog):
         bios_boot_layout.addWidget(bios_browse_button)
         boot_form_layout.addRow("BIOS Boot Image:", bios_boot_layout)
 
+        # Emulation Type
+        self.emulation_combo = QComboBox()
+        self.emulation_combo.addItems(['noemul', 'floppy', 'hdemul'])
+        current_emulation = core.boot_emulation_type or 'noemul'
+        self.emulation_combo.setCurrentText(current_emulation)
+        boot_form_layout.addRow("Emulation Type:", self.emulation_combo)
+
         # EFI Boot Image
-        self.efi_boot_image_edit = QLineEdit(efi_boot_image_path or '')
+        self.efi_boot_image_edit = QLineEdit(core.efi_boot_image_path or '')
         efi_browse_button = QPushButton("Browse...")
         efi_browse_button.clicked.connect(lambda: self.browse_for_image(self.efi_boot_image_edit, "Select EFI Boot Image"))
         efi_boot_layout = QHBoxLayout()
@@ -178,29 +196,17 @@ class PropertiesDialog(QDialog):
         self.layout.addWidget(self.buttons)
 
     def browse_for_image(self, line_edit, title):
-        """
-        Opens a file dialog to browse for a boot image.
-
-        Args:
-            line_edit (QLineEdit): The line edit to set the file path in.
-            title (str): The title of the file dialog.
-        """
         file_path, _ = QFileDialog.getOpenFileName(self, title, "", "Boot Images (*.img *.bin);;All Files (*)")
         if file_path:
             line_edit.setText(file_path)
 
     def get_properties(self):
-        """
-        Gets the updated properties from the dialog.
-
-        Returns:
-            dict: A dictionary of the updated properties.
-        """
         return {
             'volume_id': self.volume_id_edit.text(),
             'system_id': self.system_id_edit.text(),
             'boot_image_path': self.boot_image_edit.text(),
-            'efi_boot_image_path': self.efi_boot_image_edit.text()
+            'efi_boot_image_path': self.efi_boot_image_edit.text(),
+            'boot_emulation_type': self.emulation_combo.currentText()
         }
 
 class ISOEditor(QMainWindow):
@@ -755,7 +761,7 @@ class SaveWorker(QThread):
             QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
             return
 
-        dialog = PropertiesDialog(self, self.core.volume_descriptor, self.core.boot_image_path, self.core.efi_boot_image_path)
+        dialog = PropertiesDialog(self, self.core)
         if dialog.exec():
             new_props = dialog.get_properties()
             logger.info(f"ISO properties updated: {new_props}")
@@ -764,12 +770,14 @@ class SaveWorker(QThread):
             if (self.core.volume_descriptor.get('volume_id') != new_props['volume_id'] or
                 self.core.volume_descriptor.get('system_id') != new_props['system_id'] or
                 self.core.boot_image_path != new_props['boot_image_path'] or
-                self.core.efi_boot_image_path != new_props['efi_boot_image_path']):
+                self.core.efi_boot_image_path != new_props['efi_boot_image_path'] or
+                self.core.boot_emulation_type != new_props['boot_emulation_type']):
 
                 self.core.volume_descriptor['volume_id'] = new_props['volume_id']
                 self.core.volume_descriptor['system_id'] = new_props['system_id']
                 self.core.boot_image_path = new_props['boot_image_path']
                 self.core.efi_boot_image_path = new_props['efi_boot_image_path']
+                self.core.boot_emulation_type = new_props['boot_emulation_type']
                 self.core.iso_modified = True
                 self.refresh_view()
 

@@ -94,6 +94,27 @@ def test_save_iso_with_boot_image(iso_core, tmp_path):
     assert output_iso_path.exists()
     assert output_iso_path.stat().st_size > 0
 
+def test_load_iso_extracts_boot_info(iso_core, tmp_path):
+    """Test that loading a bootable ISO correctly extracts its boot information."""
+    # 1. Create a bootable ISO
+    boot_img_path = tmp_path / "boot.img"
+    boot_img_path.write_bytes(b'\x00' * 2048)
+    iso_core.boot_image_path = str(boot_img_path)
+    iso_core.boot_emulation_type = 'noemul' # Use a valid emulation type
+
+    output_iso_path = tmp_path / "bootable.iso"
+    iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+
+    # 2. Load the ISO and check the extracted info
+    new_iso_core = ISOCore()
+    new_iso_core.load_iso(str(output_iso_path))
+
+    assert len(new_iso_core.extracted_boot_info) == 1
+    boot_info = new_iso_core.extracted_boot_info[0]
+    assert boot_info['emulation_type'] == 'noemul'
+    assert boot_info['platform_id'] == 0 # 0 for x86
+    assert 'BOOT.IMG' in boot_info['boot_image_path']
+
 def test_save_and_load_empty_iso(iso_core, tmp_path):
     """
     Test that saving a completely empty ISO does not crash, and that it

@@ -56,6 +56,7 @@ class ISOCore:
             'children': [], 'parent': None
         }
         self.directory_tree['parent'] = self.directory_tree
+        self.extracted_boot_info = []
 
     def close_iso(self):
         """Closes the currently open ISO file handle, if one exists."""
@@ -103,6 +104,7 @@ class ISOCore:
                     self.volume_descriptor['system_id'] = iso.pvd.system_identifier.decode('ascii', 'ignore').strip()
 
                 self.directory_tree = self._build_tree_from_pycdlib()
+                self._extract_boot_info() # New method call
                 self.iso_modified = False
             except FileNotFoundError:
                 self.init_new_iso()
@@ -493,6 +495,76 @@ class ISOCore:
             check_node(self.directory_tree)
 
         return list(set(non_compliant_files))
+
+    def _extract_boot_info(self):
+        """
+        Extracts boot information from the loaded ISO and populates
+        the self.extracted_boot_info list.
+        """
+        self.extracted_boot_info = []
+        logger.debug("Attempting to extract boot info from loaded ISO.")
+
+        if not hasattr(self._pycdlib_instance, 'eltorito_boot_catalog'):
+            logger.debug("No El Torito boot catalog found in the ISO.")
+            return
+
+        try:
+            catalog = getattr(self._pycdlib_instance, 'eltorito_boot_catalog', None)
+            if not catalog:
+                logger.warning("pycdlib has El Torito but no catalog object found.")
+                return
+
+            entries_to_process = []
+            if hasattr(catalog, 'initial_entry'):
+                initial_entry = getattr(catalog, 'initial_entry')
+                # Check if the entry is actually initialized with data
+                if initial_entry and getattr(initial_entry, '_initialized', False):
+                    entries_to_process.append(initial_entry)
+
+            # In case of multi-boot, there might be a list. Let's check common names.
+            for attr_name in ['boot_entries', 'entries']:
+                if hasattr(catalog, attr_name):
+                    entries_to_process.extend(getattr(catalog, attr_name, []))
+
+            # Remove duplicates, as initial_entry might also be in a list
+            if entries_to_process:
+                entries_to_process = list(dict.fromkeys(entries_to_process))
+
+            logger.debug(f"Found {len(entries_to_process)} boot entries to process.")
+
+            for entry in entries_to_process:
+                media_type = getattr(entry, 'boot_media_type', -1)
+
+                # Map all floppy types to the generic 'floppy' string for consistency with the GUI.
+                media_map = {0: 'noemul', 1: 'floppy', 2: 'floppy', 3: 'floppy', 4: 'hdemul'}
+                emulation_type = media_map.get(media_type, 'unknown')
+
+                boot_inode_num = getattr(entry, 'inode', -1)
+                boot_image_path = "Unknown"
+                if boot_inode_num != -1:
+                    for root, _, files in self._pycdlib_instance.walk(iso_path='/'):
+                        for f in files:
+                            try:
+                                record = self._pycdlib_instance.get_record(iso_path=posixpath.join(root, f))
+                                if record.inode == boot_inode_num:
+                                    boot_image_path = posixpath.join(root, f)
+                                    break
+                            except:
+                                continue
+                        if boot_image_path != "Unknown":
+                            break
+
+                info = {
+                    'platform_id': getattr(entry, 'system_type', -1),
+                    'emulation_type': emulation_type,
+                    'boot_image_path': boot_image_path,
+                    'load_segment': getattr(entry, 'load_segment', -1),
+                }
+                self.extracted_boot_info.append(info)
+                logger.debug(f"Extracted boot entry: {info}")
+
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during boot info extraction: {e}")
 
 class ISOBuilder:
     """
