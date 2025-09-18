@@ -1,6 +1,9 @@
 import hashlib
 import sys
 import logging
+import glob
+import subprocess
+import re
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -15,6 +18,8 @@ import traceback
 from iso_logic import ISOCore
 
 logger = logging.getLogger(__name__)
+
+IS_LINUX = sys.platform.startswith('linux')
 
 class DroppableTreeWidget(QTreeWidget):
     """
@@ -215,6 +220,69 @@ class PropertiesDialog(QDialog):
             'boot_emulation_type': self.emulation_combo.currentText()
         }
 
+
+class RipDiscDialog(QDialog):
+    """
+    A dialog for setting up a disc ripping operation.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create ISO from Disc")
+        self.layout = QFormLayout(self)
+
+        # Drive selection
+        self.drive_combo = QComboBox()
+        self.populate_drives()
+        self.layout.addRow("Optical Drive:", self.drive_combo)
+
+        # Output file
+        self.output_path_edit = QLineEdit()
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse_output)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_path_edit)
+        output_layout.addWidget(browse_button)
+        self.layout.addRow("Output File:", output_layout)
+
+        # Dialog buttons
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Start Ripping")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addWidget(self.buttons)
+
+    def populate_drives(self):
+        """
+        Scans for optical drives and populates the combo box.
+        """
+        # A simple way to find drives on Linux
+        drives = sorted(glob.glob('/dev/sr[0-9]*'))
+        if drives:
+            self.drive_combo.addItems(drives)
+        else:
+            self.drive_combo.addItem("No drives found")
+            self.drive_combo.setEnabled(False)
+
+    def browse_output(self):
+        """
+        Opens a file dialog to select the output ISO file.
+        """
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        if file_path:
+            self.output_path_edit.setText(file_path)
+
+    def get_rip_options(self):
+        """
+        Gets the selected options from the dialog.
+        """
+        if not self.drive_combo.isEnabled():
+            return None
+        return {
+            'drive': self.drive_combo.currentText(),
+            'output_path': self.output_path_edit.text()
+        }
+
+
 class ISOEditor(QMainWindow):
     """
     The main window of the ISO Editor application.
@@ -247,6 +315,11 @@ class ISOEditor(QMainWindow):
         open_action = QAction("&Open ISO...", self)
         open_action.triggered.connect(self.open_iso)
         file_menu.addAction(open_action)
+
+        if IS_LINUX:
+            rip_disc_action = QAction("Create ISO from &Disc...", self)
+            rip_disc_action.triggered.connect(self.rip_disc)
+            file_menu.addAction(rip_disc_action)
 
         file_menu.addSeparator()
 
@@ -497,6 +570,44 @@ class ISOEditor(QMainWindow):
         QMessageBox.critical(self, "Error Saving ISO", f"An error occurred: {error_message}")
         self.update_status("Error saving ISO.")
 
+    def rip_disc(self):
+        """
+        Shows the dialog for ripping a disc to an ISO file and starts the process.
+        """
+        logger.info("Rip Disc action triggered.")
+        dialog = RipDiscDialog(self)
+        if dialog.exec():
+            options = dialog.get_rip_options()
+            if not options or not options.get('drive') or not options.get('output_path'):
+                QMessageBox.warning(self, "Invalid Options", "Please select a valid drive and an output path.")
+                return
+
+            logger.info(f"Starting disc rip with options: {options}")
+
+            self.rip_progress_dialog = QProgressDialog("Ripping disc...", "Cancel", 0, 100, self)
+            self.rip_progress_dialog.setWindowModality(Qt.WindowModal)
+            self.rip_progress_dialog.setAutoClose(True)
+
+            self.rip_thread = RipDiscWorker(options['drive'], options['output_path'])
+            self.rip_thread.progress.connect(self.update_rip_progress)
+            self.rip_thread.finished.connect(self.rip_finished)
+            self.rip_progress_dialog.canceled.connect(self.rip_thread.stop) # Connect cancel button
+
+            self.rip_thread.start()
+            self.rip_progress_dialog.exec()
+
+    def update_rip_progress(self, value):
+        self.rip_progress_dialog.setValue(value)
+
+    def rip_finished(self, error_message):
+        self.rip_progress_dialog.setValue(100)
+        if error_message:
+            QMessageBox.critical(self, "Ripping Failed", error_message)
+            self.update_status("Disc ripping failed.")
+        else:
+            QMessageBox.information(self, "Success", "Disc has been successfully ripped to an ISO file.")
+            self.update_status("Disc ripping complete.")
+
 class SaveWorker(QThread):
     progress = Signal(int)
     finished = Signal(str)
@@ -550,6 +661,68 @@ class ChecksumWorker(QThread):
         except Exception as e:
             logger.error(f"Checksum calculation failed for {self.file_path}: {e}")
             self.finished.emit({}, f"Failed to calculate checksums: {e}")
+
+
+class RipDiscWorker(QThread):
+    """
+    A QThread worker for ripping a disc in the background using dd.
+    """
+    progress = Signal(int) # Percentage
+    finished = Signal(str) # Error message (if any)
+
+    def __init__(self, source_drive, dest_path):
+        super().__init__()
+        self.source_drive = source_drive
+        self.dest_path = dest_path
+        self._is_running = True
+
+    def run(self):
+        """
+        Executes the dd command to rip the disc.
+        """
+        command = [
+            'dd',
+            f'if={self.source_drive}',
+            f'of={self.dest_path}',
+            'bs=2048',
+            'status=progress'
+        ]
+
+        try:
+            process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+
+            # This is a simplification. A better implementation would get the disc size first.
+            DVD_SIZE_BYTES = 4.7 * 1024 * 1024 * 1024
+
+            while self._is_running and process.poll() is None:
+                line = process.stderr.readline()
+                if line:
+                    match = re.search(r'(\d+)\s+bytes', line)
+                    if match:
+                        bytes_copied = int(match.group(1))
+                        percent = int((bytes_copied / DVD_SIZE_BYTES) * 100)
+                        self.progress.emit(min(percent, 100))
+
+            if not self._is_running:
+                process.terminate()
+                self.finished.emit("Ripping cancelled by user.")
+                return
+
+            retcode = process.wait()
+            if retcode == 0:
+                self.progress.emit(100)
+                self.finished.emit("") # Success
+            else:
+                self.finished.emit(f"dd command failed with exit code {retcode}")
+
+        except FileNotFoundError:
+            self.finished.emit("Error: 'dd' command not found. Is it installed and in your PATH?")
+        except Exception as e:
+            logger.error(f"Disc ripping failed: {e}")
+            self.finished.emit(f"An unexpected error occurred: {e}")
+
+    def stop(self):
+        self._is_running = False
 
 
     def get_selected_node(self):
