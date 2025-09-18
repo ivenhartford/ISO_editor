@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import logging
 from PySide6.QtWidgets import (
@@ -98,6 +99,10 @@ class SaveAsDialog(QDialog):
         self.hybrid_checkbox.setChecked(False)
         form_layout.addRow(self.hybrid_checkbox)
 
+        self.checksum_checkbox = QCheckBox("Verify checksums after saving")
+        self.checksum_checkbox.setChecked(True)
+        form_layout.addRow(self.checksum_checkbox)
+
         self.layout.addLayout(form_layout)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
@@ -114,7 +119,8 @@ class SaveAsDialog(QDialog):
         return {
             'file_path': self.file_path_edit.text(),
             'use_udf': self.udf_checkbox.isChecked(),
-            'make_hybrid': self.hybrid_checkbox.isChecked()
+            'make_hybrid': self.hybrid_checkbox.isChecked(),
+            'calculate_checksums': self.checksum_checkbox.isChecked()
         }
 
 class PropertiesDialog(QDialog):
@@ -390,7 +396,8 @@ class ISOEditor(QMainWindow):
         if not self.core.current_iso_path:
             self.save_iso_as()
         else:
-            self._perform_save(self.core.current_iso_path)
+            # When re-saving, we don't show the options dialog, so we use default values.
+            self._perform_save(self.core.current_iso_path, use_udf=True, make_hybrid=False, calculate_checksums=False)
 
     def save_iso_as(self):
         """Saves the current ISO to a new path."""
@@ -399,22 +406,23 @@ class ISOEditor(QMainWindow):
         if dialog.exec():
             options = dialog.get_options()
             if options['file_path']:
-                self._perform_save(options['file_path'], options['use_udf'], options['make_hybrid'])
+                self._perform_save(
+                    options['file_path'],
+                    options['use_udf'],
+                    options['make_hybrid'],
+                    options['calculate_checksums']
+                )
             else:
                 logger.info("Save As dialog cancelled.")
         else:
             logger.info("Save As dialog cancelled.")
 
-    def _perform_save(self, file_path, use_udf, make_hybrid):
+    def _perform_save(self, file_path, use_udf, make_hybrid, calculate_checksums=False):
         """
         Performs the save operation, including filename validation.
-
-        Args:
-            file_path (str): The path to save the ISO to.
-            use_udf (bool): Whether to use UDF.
-            make_hybrid (bool): Whether to make the ISO a hybrid ISO.
         """
         logger.info(f"Attempting to save ISO to {file_path}")
+        self.should_calculate_checksums = calculate_checksums
 
         # Validate filenames before saving
         non_compliant_files = self.core.find_non_compliant_filenames()
@@ -460,7 +468,28 @@ class ISOEditor(QMainWindow):
         self.refresh_view()
         self.update_status(f"Successfully saved to {os.path.basename(file_path)}")
         logger.info(f"ISO saved successfully to {file_path}")
-        QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+
+        if self.should_calculate_checksums:
+            self.update_status(f"Saved. Now calculating checksums for {os.path.basename(file_path)}...")
+            self.checksum_thread = ChecksumWorker(file_path)
+            self.checksum_thread.finished.connect(self.checksum_finished)
+            self.checksum_thread.start()
+        else:
+            QMessageBox.information(self, "Success", "ISO file has been saved successfully.")
+
+    def checksum_finished(self, hashes, error_string):
+        if error_string:
+            QMessageBox.critical(self, "Error", error_string)
+            self.update_status("Error calculating checksums.")
+            return
+
+        checksum_text = (f"Checksums for {os.path.basename(self.core.current_iso_path)}:\n\n"
+                         f"MD5:    {hashes['md5']}\n"
+                         f"SHA-1:  {hashes['sha1']}\n"
+                         f"SHA-256: {hashes['sha256']}")
+
+        QMessageBox.information(self, "Checksums", checksum_text)
+        self.update_status("Checksum calculation complete.")
 
     def save_error(self, error_message):
         self.progress_dialog.close()
@@ -491,6 +520,37 @@ class SaveWorker(QThread):
             self.finished.emit(self.file_path)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class ChecksumWorker(QThread):
+    """
+    A QThread worker for calculating file checksums in the background.
+    """
+    # Signal -> dict: e.g., {'md5': '...', 'sha1': '...', 'sha256': '...'}
+    #           str:  Error message if something goes wrong.
+    finished = Signal(dict, str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        """
+        Calculates MD5, SHA1, and SHA256 hashes for the file.
+        """
+        try:
+            hashes = {'md5': hashlib.md5(), 'sha1': hashlib.sha1(), 'sha256': hashlib.sha256()}
+            with open(self.file_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    for h in hashes.values():
+                        h.update(chunk)
+
+            results = {name: h.hexdigest() for name, h in hashes.items()}
+            self.finished.emit(results, "")
+        except Exception as e:
+            logger.error(f"Checksum calculation failed for {self.file_path}: {e}")
+            self.finished.emit({}, f"Failed to calculate checksums: {e}")
+
 
     def get_selected_node(self):
         """
