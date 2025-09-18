@@ -94,6 +94,35 @@ def test_save_iso_with_boot_image(iso_core, tmp_path):
     assert output_iso_path.exists()
     assert output_iso_path.stat().st_size > 0
 
+def test_save_and_load_empty_iso(iso_core, tmp_path):
+    """
+    Test that saving a completely empty ISO does not crash, and that it
+    can be loaded back correctly.
+    """
+    output_iso_path = tmp_path / "empty.iso"
+
+    # Save the initial, empty ISO structure
+    try:
+        iso_core.save_iso(str(output_iso_path), use_joliet=True, use_rock_ridge=True)
+    except Exception as e:
+        pytest.fail(f"Saving an empty ISO raised an exception: {e}")
+
+    assert output_iso_path.exists()
+    assert output_iso_path.stat().st_size > 0
+
+    # Load the empty ISO into a new core
+    new_iso_core = ISOCore()
+    try:
+        new_iso_core.load_iso(str(output_iso_path))
+    except Exception as e:
+        pytest.fail(f"Loading a saved empty ISO raised an exception: {e}")
+
+    # The loaded ISO should just have an empty root directory
+    assert new_iso_core.directory_tree is not None
+    assert new_iso_core.directory_tree['name'] == '/'
+    assert new_iso_core.directory_tree['is_directory'] is True
+    assert len(new_iso_core.directory_tree['children']) == 0
+
 def test_save_iso_with_hybrid_boot(iso_core, tmp_path):
     """
     Test that saving an ISO with both a BIOS and an EFI boot image

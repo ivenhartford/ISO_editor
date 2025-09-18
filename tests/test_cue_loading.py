@@ -73,3 +73,45 @@ def test_load_cue_sheet(iso_core, tmp_path):
     assert track1_data[0] == 0x11
     assert track2_data[0] == 0x11 # The first part of track 2 is from the first block
     assert track2_data[-1] == 0x22
+
+def test_load_cue_with_missing_bin_file(iso_core, tmp_path):
+    """Test loading a CUE that points to a non-existent BIN file."""
+    cue_content = 'FILE "MISSING.BIN" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00'
+    cue_path = tmp_path / "test.cue"
+    cue_path.write_text(cue_content)
+
+    # This should still load the structure, but getting data will fail.
+    iso_core.load_iso(str(cue_path))
+    assert len(iso_core.directory_tree['children']) == 1
+    track_node = iso_core.directory_tree['children'][0]
+    assert track_node['name'] == 'TRACK_01.wav'
+    assert track_node['size'] == 0 # Size is 0 because BIN is missing
+
+    # Attempting to get data should return empty bytes, not raise an error
+    data = iso_core.get_file_data(track_node)
+    assert data == b''
+
+def test_load_cue_with_syntax_error(iso_core, tmp_path):
+    """Test loading a CUE sheet with a syntax error."""
+    # "TRACK" is misspelled as "TRAK"
+    cue_content = 'FILE "IMAGE.BIN" BINARY\n  TRAK 01 AUDIO\n    INDEX 01 00:00:00'
+    cue_path = tmp_path / "bad.cue"
+    bin_path = tmp_path / "IMAGE.BIN"
+    bin_path.write_bytes(b'\x00' * 1024)
+    cue_path.write_text(cue_content)
+
+    # ISOCore should detect that no tracks were parsed and raise an error.
+    with pytest.raises(ValueError, match="CUE sheet is invalid or contains no tracks"):
+        iso_core.load_iso(str(cue_path))
+
+def test_load_cue_with_invalid_offset(iso_core, tmp_path):
+    """Test loading a CUE sheet with an invalid time offset."""
+    # The offset "00:70:00" is invalid because seconds go up to 59.
+    cue_content = 'FILE "IMAGE.BIN" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:70:00'
+    cue_path = tmp_path / "bad_offset.cue"
+    bin_path = tmp_path / "IMAGE.BIN"
+    bin_path.write_bytes(b'\x00' * 1024)
+    cue_path.write_text(cue_content)
+
+    with pytest.raises(ValueError, match="Invalid CUE offset format"):
+        iso_core.load_iso(str(cue_path))

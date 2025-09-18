@@ -203,20 +203,37 @@ def test_complex_load_iso_after_save(iso_core, tmp_path):
     root_node = iso_core.directory_tree
     # Use names that are valid for Joliet/RR but need sanitizing for base ISO9660
     dir1_name = "dIR1"
-    long_dir_name = "long_directory_name" # Changed to be valid
+    long_dir_name = "long_directory_name"
     long_file_name = "long file name with spaces.txt"
+    special_chars_dir_name = "special-chars-@!#$"
+    special_chars_file_name = "file-with-special-chars-!@#$.txt"
+    very_long_file_name = "a" * 100 + ".txt"
 
     iso_core.add_folder_to_directory(dir1_name, root_node)
     iso_core.add_folder_to_directory(long_dir_name, root_node)
+    iso_core.add_folder_to_directory(special_chars_dir_name, root_node)
 
     dir1_node = next(c for c in root_node['children'] if c['name'] == dir1_name)
     long_dir_node = next(c for c in root_node['children'] if c['name'] == long_dir_name)
+    special_chars_dir_node = next(c for c in root_node['children'] if c['name'] == special_chars_dir_name)
 
     # Add a file with a long name and spaces
     long_file_content = b"long file content"
     long_file_path = tmp_path / long_file_name
     long_file_path.write_bytes(long_file_content)
     iso_core.add_file_to_directory(str(long_file_path), root_node)
+
+    # Add a file with special characters
+    special_file_content = b"special content"
+    special_file_path = tmp_path / special_chars_file_name
+    special_file_path.write_bytes(special_file_content)
+    iso_core.add_file_to_directory(str(special_file_path), special_chars_dir_node)
+
+    # Add a file with a very long name
+    very_long_file_content = b"very long file content"
+    very_long_file_path = tmp_path / very_long_file_name
+    very_long_file_path.write_bytes(very_long_file_content)
+    iso_core.add_file_to_directory(str(very_long_file_path), root_node)
 
     # Add a nested file
     nested_content = b"nested"
@@ -240,20 +257,33 @@ def test_complex_load_iso_after_save(iso_core, tmp_path):
 
     # 4. Assert the structure and content are identical
     new_root = new_iso_core.directory_tree
-    # The root should contain the two directories and one file
-    assert len(new_root['children']) == 3
+    # The root should contain three directories and two files
+    assert len(new_root['children']) == 5
 
     # Find nodes (names should be preserved by Rock Ridge/Joliet)
     new_dir1 = next((c for c in new_root['children'] if c['name'] == dir1_name), None)
     new_long_dir = next((c for c in new_root['children'] if c['name'] == long_dir_name), None)
+    new_special_dir = next((c for c in new_root['children'] if c['name'] == special_chars_dir_name), None)
     new_long_file = next((c for c in new_root['children'] if c['name'] == long_file_name), None)
+    new_very_long_file = next((c for c in new_root['children'] if c['name'] == very_long_file_name), None)
 
     assert new_dir1 is not None and new_dir1['is_directory']
     assert new_long_dir is not None and new_long_dir['is_directory']
+    assert new_special_dir is not None and new_special_dir['is_directory']
     assert new_long_file is not None and not new_long_file['is_directory']
+    assert new_very_long_file is not None and not new_very_long_file['is_directory']
 
     assert new_long_file['size'] == len(long_file_content)
     assert new_iso_core.get_file_data(new_long_file) == long_file_content
+
+    assert new_very_long_file['size'] == len(very_long_file_content)
+    assert new_iso_core.get_file_data(new_very_long_file) == very_long_file_content
+
+    assert len(new_special_dir['children']) == 1
+    special_file_node = new_special_dir['children'][0]
+    assert special_file_node['name'] == special_chars_file_name
+    assert special_file_node['size'] == len(special_file_content)
+    assert new_iso_core.get_file_data(special_file_node) == special_file_content
 
     assert len(new_dir1['children']) == 1
     nested_file_node = new_dir1['children'][0]

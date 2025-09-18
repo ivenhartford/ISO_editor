@@ -83,14 +83,9 @@ class ISOCore:
 
         _, extension = os.path.splitext(file_path)
         if extension.lower() == '.cue':
-            try:
-                self._load_cue_sheet(file_path)
-                self.current_iso_path = file_path
-                self.iso_modified = False
-            except Exception as e:
-                self.init_new_iso()
-                logger.exception(f"An unexpected error occurred while loading the CUE sheet: {e}")
-                raise ValueError(f"Failed to parse CUE sheet: {e}") from e
+            self._load_cue_sheet(file_path)
+            self.current_iso_path = file_path
+            self.iso_modified = False
         else:
             try:
                 iso = pycdlib.PyCdlib()
@@ -133,7 +128,15 @@ class ISOCore:
         cue_sheet = CueSheet()
         cue_sheet.setOutputFormat('%performer% - %title%', '%performer% - %title%')
         cue_sheet.setData(cue_data)
-        cue_sheet.parse()
+        try:
+            cue_sheet.parse()
+        except Exception as e:
+            logger.error(f"CueParser failed to parse CUE data. Error: {e}")
+            raise ValueError(f"Failed to parse CUE sheet: {e}") from e
+
+        # If parsing results in no tracks, but there was data, it's an error
+        if not cue_sheet.tracks and cue_data.strip():
+            raise ValueError("CUE sheet is invalid or contains no tracks.")
 
         self.volume_descriptor['volume_id'] = cue_sheet.title or "CUE_SHEET"
 
@@ -176,9 +179,14 @@ class ISOCore:
         """Converts a CUE sheet offset string (MM:SS:FF) to bytes."""
         try:
             parts = offset_str.split(':')
+            if len(parts) != 3:
+                raise ValueError("Offset must be in MM:SS:FF format")
             minutes = int(parts[0])
             seconds = int(parts[1])
             frames = int(parts[2])
+            if not (0 <= seconds < 60 and 0 <= frames < 75):
+                raise ValueError(f"Invalid time component in offset: seconds={seconds}, frames={frames}")
+
             total_frames = (minutes * 60 * 75) + (seconds * 75) + frames
             return total_frames * 2352 # 2352 bytes per frame for CD-DA
         except (ValueError, IndexError) as e:
@@ -532,18 +540,27 @@ class ISOBuilder:
 
         for joliet_path, iso9660_path, udf_path, node in all_nodes:
             rr_name = node['name']
+
+            # Don't use Joliet path if the name is too long.
+            # UDF and Rock Ridge can handle it.
+            current_joliet_path = joliet_path
+            if len(node['name']) > 64:
+                current_joliet_path = None
+
             if node['is_directory']:
                 try:
-                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=joliet_path, udf_path=udf_path)
+                    self.iso.add_directory(iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
                 except Exception as e:
                     if 'File already exists' not in str(e):
                         logger.error(f"Failed to add directory {joliet_path} to ISO: {e}")
+                        raise
             else:
                 try:
                     file_data = self.core.get_file_data(node)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=joliet_path, udf_path=udf_path)
+                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
                 except Exception as e:
                     logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
+                    raise
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
