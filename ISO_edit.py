@@ -5,6 +5,7 @@ import glob
 import subprocess
 import re
 import json
+import argparse
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -31,10 +32,11 @@ from constants import (
     BOOT_PLATFORM_X86, BOOT_PLATFORM_POWERPC,
     BOOT_PLATFORM_MAC, BOOT_PLATFORM_EFI,
     CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME,
-    RECENT_FILES_FILENAME,
+    RECENT_FILES_FILENAME, SETTINGS_FILENAME, LOG_FILENAME,
     ISO_FILE_FILTER, ISO_SAVE_FILTER, BOOT_IMAGE_FILTER,
     STATUS_READY, STATUS_MODIFIED_SUFFIX,
     ITEM_TYPE_FILE, ITEM_TYPE_DIRECTORY,
+    DEFAULT_LOG_LEVEL, DEFAULT_LOG_FORMAT,
 )
 
 logger = logging.getLogger(__name__)
@@ -487,6 +489,7 @@ class ISOEditor(QMainWindow):
         self.create_menu()
         self.create_main_interface()
         self.create_status_bar()
+        self.restore_window_state()
         self.refresh_view()
 
     def create_menu(self):
@@ -598,7 +601,7 @@ class ISOEditor(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
 
         # Left pane
         left_pane = QGroupBox("ISO Properties")
@@ -613,7 +616,7 @@ class ISOEditor(QMainWindow):
         left_layout.addWidget(self.volume_name_label)
         left_layout.addStretch()
 
-        splitter.addWidget(left_pane)
+        self.splitter.addWidget(left_pane)
 
         # Right pane
         right_pane = QGroupBox("ISO Contents")
@@ -632,10 +635,10 @@ class ISOEditor(QMainWindow):
         self.tree.setSelectionMode(self.tree.ExtendedSelection)  # Allow multi-selection
         right_layout.addWidget(self.tree)
 
-        splitter.addWidget(right_pane)
+        self.splitter.addWidget(right_pane)
 
-        splitter.setSizes([DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH])
-        main_layout.addWidget(splitter)
+        self.splitter.setSizes([DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH])
+        main_layout.addWidget(self.splitter)
 
     def create_status_bar(self):
         """Creates the status bar."""
@@ -1316,6 +1319,9 @@ class RipDiscWorker(QThread):
                 event.ignore()
                 return
 
+        # Save window state before closing
+        self.save_window_state()
+
         # Clean up resources
         self.core.close_iso()
         event.accept()
@@ -1412,6 +1418,81 @@ class RipDiscWorker(QThread):
         self.save_recent_files()
         self.update_recent_files_menu()
 
+    def get_settings_path(self):
+        """Returns the path to the settings JSON file."""
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(home, CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME)
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, SETTINGS_FILENAME)
+
+    def load_settings(self):
+        """Loads application settings from disk."""
+        try:
+            settings_path = self.get_settings_path()
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+            return {}
+
+    def save_settings(self, settings):
+        """Saves application settings to disk."""
+        try:
+            settings_path = self.get_settings_path()
+            with open(settings_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+
+    def restore_window_state(self):
+        """Restores window geometry and splitter state from saved settings."""
+        settings = self.load_settings()
+
+        # Restore window geometry
+        geometry = settings.get('window_geometry')
+        if geometry:
+            try:
+                self.setGeometry(
+                    geometry.get('x', 100),
+                    geometry.get('y', 100),
+                    geometry.get('width', DEFAULT_WINDOW_WIDTH),
+                    geometry.get('height', DEFAULT_WINDOW_HEIGHT)
+                )
+                logger.debug(f"Restored window geometry: {geometry}")
+            except Exception as e:
+                logger.warning(f"Failed to restore window geometry: {e}")
+
+        # Restore window state (maximized, etc.)
+        if settings.get('window_maximized', False):
+            self.showMaximized()
+
+        # Restore splitter state
+        splitter_sizes = settings.get('splitter_sizes')
+        if splitter_sizes and len(splitter_sizes) == 2:
+            try:
+                self.splitter.setSizes(splitter_sizes)
+                logger.debug(f"Restored splitter sizes: {splitter_sizes}")
+            except Exception as e:
+                logger.warning(f"Failed to restore splitter sizes: {e}")
+
+    def save_window_state(self):
+        """Saves current window geometry and splitter state to settings."""
+        geometry = self.geometry()
+        settings = {
+            'window_geometry': {
+                'x': geometry.x(),
+                'y': geometry.y(),
+                'width': geometry.width(),
+                'height': geometry.height()
+            },
+            'window_maximized': self.isMaximized(),
+            'splitter_sizes': self.splitter.sizes()
+        }
+        self.save_settings(settings)
+        logger.debug("Saved window state")
+
     def refresh_view(self):
         """Refreshes the tree view to show the current state of the ISO."""
         logger.debug("Refreshing tree view.")
@@ -1491,17 +1572,125 @@ class RipDiscWorker(QThread):
             size /= 1024.0
         return f"{size:.1f} TB"
 
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog='iso-editor',
+        description=f'{APP_NAME} - A comprehensive ISO image editor',
+        epilog=f'Version {VERSION}',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'{APP_NAME} {VERSION}'
+    )
+
+    parser.add_argument(
+        'file',
+        nargs='?',
+        help='ISO or CUE file to open on startup'
+    )
+
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        default=DEFAULT_LOG_LEVEL,
+        help=f'Set the logging level (default: {DEFAULT_LOG_LEVEL})'
+    )
+
+    parser.add_argument(
+        '--log-file',
+        default=LOG_FILENAME,
+        help=f'Set the log file path (default: {LOG_FILENAME})'
+    )
+
+    parser.add_argument(
+        '--no-log-file',
+        action='store_true',
+        help='Disable logging to file (log to console only)'
+    )
+
+    return parser.parse_args()
+
+
+def setup_logging(log_level, log_file=None):
+    """
+    Configure application logging.
+
+    Args:
+        log_level (str): The logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file (str, optional): Path to log file. If None, logs to console only.
+    """
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        numeric_level = getattr(logging, DEFAULT_LOG_LEVEL)
+
+    handlers = []
+
+    # Always add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(DEFAULT_LOG_FORMAT))
+    handlers.append(console_handler)
+
+    # Add file handler if log_file is specified
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='w')
+            file_handler.setFormatter(logging.Formatter(DEFAULT_LOG_FORMAT))
+            handlers.append(file_handler)
+        except (IOError, OSError) as e:
+            print(f"Warning: Could not create log file '{log_file}': {e}", file=sys.stderr)
+
+    logging.basicConfig(
+        level=numeric_level,
+        format=DEFAULT_LOG_FORMAT,
+        handlers=handlers
+    )
+
+
 def main():
     """The main entry point of the application."""
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        filename='iso_editor.log',
-                        filemode='w')
-    logger.info("Application starting...")
-    app = QApplication(sys.argv)
-    editor = ISOEditor()
-    editor.show()
-    sys.exit(app.exec())
+    args = parse_arguments()
+
+    # Setup logging based on arguments
+    log_file = None if args.no_log_file else args.log_file
+    setup_logging(args.log_level, log_file)
+
+    logger.info(f"{APP_NAME} version {VERSION} starting...")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {sys.platform}")
+    logger.info(f"Log level: {args.log_level}")
+
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+        app.setApplicationVersion(VERSION)
+
+        editor = ISOEditor()
+
+        # Open file if specified on command line
+        if args.file:
+            logger.info(f"Opening file from command line: {args.file}")
+            try:
+                editor.core.load_iso(args.file)
+                editor.refresh_view()
+                editor.add_to_recent_files(args.file)
+                editor.update_status(f"Loaded ISO: {os.path.basename(args.file)}")
+            except Exception as e:
+                logger.exception(f"Failed to load file from command line: {e}")
+                QMessageBox.critical(editor, "Error", f"Failed to load file: {str(e)}")
+
+        editor.show()
+        logger.info("Application window shown, entering main event loop...")
+        sys.exit(app.exec())
+
+    except Exception as e:
+        logger.exception(f"Fatal error in main: {e}")
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
