@@ -367,6 +367,7 @@ class ISOCore:
     def add_file_to_directory(self, file_path, target_node):
         """
         Adds a file from the local filesystem to a directory in the ISO structure.
+        For large files (>100MB), stores only the path to stream during save.
 
         Args:
             file_path (str): The path to the local file to add.
@@ -377,19 +378,45 @@ class ISOCore:
 
         logger.info(f"Adding file '{file_path}' to '{self.get_node_path(target_node)}'")
         filename = os.path.basename(file_path)
+
+        # Memory optimization threshold: 100 MB
+        LARGE_FILE_THRESHOLD = 100 * 1024 * 1024
+
         try:
-            with open(file_path, 'rb') as f: file_data = f.read()
             file_stats = os.stat(file_path)
+            file_size = file_stats.st_size
+
+            # For large files, store only the path to stream later
+            if file_size > LARGE_FILE_THRESHOLD:
+                logger.info(f"Large file detected ({file_size} bytes), will stream from disk during save")
+                new_node = {
+                    'name': filename, 'is_directory': False, 'is_hidden': False,
+                    'size': file_size,
+                    'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    'extent_location': 0, 'children': [], 'parent': target_node,
+                    'file_path': file_path,  # Store path instead of data
+                    'file_data': None,  # No data in memory
+                    'is_new': True,
+                    'is_large_file': True  # Flag for streaming
+                }
+            else:
+                # For small files, read into memory as before
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+
+                new_node = {
+                    'name': filename, 'is_directory': False, 'is_hidden': False,
+                    'size': len(file_data),
+                    'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    'extent_location': 0, 'children': [], 'parent': target_node,
+                    'file_data': file_data,
+                    'is_new': True,
+                    'is_large_file': False
+                }
         except (FileNotFoundError, IOError) as e:
             logger.error(f"Error adding file {file_path}: {e}")
             raise IOError(f"File not found or unreadable: {file_path}") from e
 
-        new_node = {
-            'name': filename, 'is_directory': False, 'is_hidden': False,
-            'size': len(file_data), 'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            'extent_location': 0, 'children': [], 'parent': target_node,
-            'file_data': file_data, 'is_new': True
-        }
         target_node['children'] = [c for c in target_node['children'] if c['name'].lower() != filename.lower()]
         target_node['children'].append(new_node)
         self.iso_modified = True
@@ -628,12 +655,28 @@ class ISOBuilder:
                         logger.error(f"Failed to add directory {joliet_path} to ISO: {e}")
                         raise
             else:
-                try:
-                    file_data = self.core.get_file_data(node)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
-                except Exception as e:
-                    logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
-                    raise
+                # Check if this is a large file that should be streamed from disk
+                if node.get('is_new') and node.get('is_large_file'):
+                    # Large file - stream directly from disk without loading into memory
+                    file_path = node.get('file_path')
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            logger.debug(f"Streaming large file from {file_path}")
+                            self.iso.add_file(file_path, iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
+                        except Exception as e:
+                            logger.error(f"Failed to add large file {joliet_path} to ISO: {e}")
+                            raise
+                    else:
+                        logger.error(f"Large file path not found for {joliet_path}: {file_path}")
+                        raise FileNotFoundError(f"File not found: {file_path}")
+                else:
+                    # Small file or existing file - use existing approach
+                    try:
+                        file_data = self.core.get_file_data(node)
+                        self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
+                    except Exception as e:
+                        logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
+                        raise
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
