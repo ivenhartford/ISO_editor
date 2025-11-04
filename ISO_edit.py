@@ -489,6 +489,7 @@ class ISOEditor(QMainWindow):
         self.command_history = CommandHistory(max_history=50)
         self.tree_item_map = {}
         self.show_hidden = False
+        self.dark_mode = False
         self.recent_files = self.load_recent_files()
         self.max_recent_files = MAX_RECENT_FILES
 
@@ -623,6 +624,15 @@ class ISOEditor(QMainWindow):
 
         view_menu.addSeparator()
 
+        # Dark Mode toggle
+        self.dark_mode_action = QAction("&Dark Mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setStatusTip("Toggle dark mode theme")
+        self.dark_mode_action.triggered.connect(self.toggle_dark_mode)
+        view_menu.addAction(self.dark_mode_action)
+
+        view_menu.addSeparator()
+
         statistics_action = QAction("ISO &Statistics...", self)
         statistics_action.setStatusTip("Show ISO statistics and file breakdown")
         statistics_action.triggered.connect(self.show_statistics)
@@ -745,6 +755,272 @@ class ISOEditor(QMainWindow):
             self.redo_action.setStatusTip(f"Redo: {desc}")
         else:
             self.redo_action.setStatusTip("Redo the last undone action")
+
+    def toggle_dark_mode(self):
+        """Toggle between dark and light mode."""
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        self.save_window_state()
+        mode_name = "dark" if self.dark_mode else "light"
+        self.update_status(f"Switched to {mode_name} mode")
+        logger.info(f"Theme changed to {mode_name} mode")
+
+    def apply_theme(self):
+        """Apply the current theme (dark or light)."""
+        if self.dark_mode:
+            self.setStyleSheet(self.get_dark_stylesheet())
+        else:
+            self.setStyleSheet("")  # Reset to default light theme
+
+    def get_dark_stylesheet(self) -> str:
+        """Get the dark mode stylesheet."""
+        return """
+            /* Dark Mode Stylesheet */
+            QMainWindow, QDialog, QWidget {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+            }
+
+            /* Menu Bar */
+            QMenuBar {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border-bottom: 1px solid #3c3c3c;
+            }
+            QMenuBar::item:selected {
+                background-color: #3c3c3c;
+            }
+
+            /* Menus */
+            QMenu {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+            }
+            QMenu::item:selected {
+                background-color: #3c3c3c;
+            }
+
+            /* Status Bar */
+            QStatusBar {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border-top: 1px solid #3c3c3c;
+            }
+
+            /* Tree Widget */
+            QTreeWidget {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #37373d;
+                alternate-background-color: #252526;
+            }
+            QTreeWidget::item:hover {
+                background-color: #2a2d2e;
+            }
+            QTreeWidget::item:selected {
+                background-color: #37373d;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                padding: 4px;
+            }
+
+            /* Buttons */
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #4c4c4c;
+                border-radius: 4px;
+                padding: 5px 15px;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #2b2b2b;
+            }
+            QPushButton:disabled {
+                background-color: #2b2b2b;
+                color: #6e6e6e;
+            }
+
+            /* Line Edit */
+            QLineEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                padding: 4px;
+                selection-background-color: #264f78;
+            }
+            QLineEdit:focus {
+                border: 1px solid #007acc;
+            }
+
+            /* Text Edit */
+            QTextEdit, QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+
+            /* Combo Box */
+            QComboBox {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #4c4c4c;
+                border-radius: 3px;
+                padding: 4px;
+            }
+            QComboBox:hover {
+                background-color: #505050;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3c3c3c;
+            }
+            QComboBox::down-arrow {
+                image: url(none);
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid #d4d4d4;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                selection-background-color: #37373d;
+                border: 1px solid #3c3c3c;
+            }
+
+            /* Check Box */
+            QCheckBox {
+                color: #d4d4d4;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #4c4c4c;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #007acc;
+                border-color: #007acc;
+            }
+
+            /* Group Box */
+            QGroupBox {
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 1ex;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                color: #d4d4d4;
+            }
+
+            /* Label */
+            QLabel {
+                color: #d4d4d4;
+            }
+
+            /* Scroll Bar */
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #5a5a5a;
+                min-height: 20px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #6a6a6a;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #5a5a5a;
+                min-width: 20px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #6a6a6a;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+
+            /* Splitter */
+            QSplitter::handle {
+                background-color: #3c3c3c;
+            }
+            QSplitter::handle:hover {
+                background-color: #505050;
+            }
+
+            /* Progress Dialog */
+            QProgressDialog {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+            }
+            QProgressBar {
+                background-color: #1e1e1e;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                text-align: center;
+                color: #d4d4d4;
+            }
+            QProgressBar::chunk {
+                background-color: #007acc;
+            }
+
+            /* Message Box */
+            QMessageBox {
+                background-color: #2b2b2b;
+            }
+            QMessageBox QLabel {
+                color: #d4d4d4;
+            }
+
+            /* Tab Widget */
+            QTabWidget::pane {
+                border: 1px solid #3c3c3c;
+                background-color: #1e1e1e;
+            }
+            QTabBar::tab {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                padding: 5px 10px;
+            }
+            QTabBar::tab:selected {
+                background-color: #1e1e1e;
+                border-bottom-color: #1e1e1e;
+            }
+            QTabBar::tab:hover {
+                background-color: #3c3c3c;
+            }
+        """
 
     def create_status_bar(self):
         """Creates the status bar."""
@@ -2118,8 +2394,14 @@ class RipDiscWorker(QThread):
             except Exception as e:
                 logger.warning(f"Failed to restore splitter sizes: {e}")
 
+        # Restore dark mode setting
+        self.dark_mode = settings.get('dark_mode', False)
+        self.dark_mode_action.setChecked(self.dark_mode)
+        self.apply_theme()
+        logger.debug(f"Restored dark mode: {self.dark_mode}")
+
     def save_window_state(self):
-        """Saves current window geometry and splitter state to settings."""
+        """Saves current window geometry, splitter state, and dark mode preference to settings."""
         geometry = self.geometry()
         settings = {
             'window_geometry': {
@@ -2129,7 +2411,8 @@ class RipDiscWorker(QThread):
                 'height': geometry.height()
             },
             'window_maximized': self.isMaximized(),
-            'splitter_sizes': self.splitter.sizes()
+            'splitter_sizes': self.splitter.sizes(),
+            'dark_mode': self.dark_mode
         }
         self.save_settings(settings)
         logger.debug("Saved window state")
