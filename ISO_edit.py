@@ -17,6 +17,25 @@ from PySide6.QtCore import Qt, QPoint, Signal, QThread
 import os
 import traceback
 from iso_logic import ISOCore
+from constants import (
+    VERSION, APP_NAME,
+    MAX_VOLUME_ID_LENGTH, MAX_SYSTEM_ID_LENGTH,
+    JOLIET_MAX_FILENAME_LENGTH, MAX_RECENT_FILES,
+    DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH,
+    TREE_COLUMN_NAME_WIDTH, TREE_COLUMN_SIZE_WIDTH,
+    TREE_COLUMN_DATE_WIDTH, TREE_COLUMN_TYPE_WIDTH,
+    FILE_READ_BUFFER_SIZE, DVD_SIZE_BYTES,
+    PROCESS_TERMINATE_TIMEOUT_SEC,
+    DRAG_BORDER_COLOR, DRAG_BACKGROUND_COLOR,
+    BOOT_PLATFORM_X86, BOOT_PLATFORM_POWERPC,
+    BOOT_PLATFORM_MAC, BOOT_PLATFORM_EFI,
+    CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME,
+    RECENT_FILES_FILENAME,
+    ISO_FILE_FILTER, ISO_SAVE_FILTER, BOOT_IMAGE_FILTER,
+    STATUS_READY, STATUS_MODIFIED_SUFFIX,
+    ITEM_TYPE_FILE, ITEM_TYPE_DIRECTORY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +71,8 @@ class DroppableTreeWidget(QTreeWidget):
             self._drag_active = True
             if not self._original_style:
                 self._original_style = self.styleSheet()
-            self.setStyleSheet(self._original_style + "\nQTreeWidget { border: 2px solid #4A90E2; background-color: #E8F4FF; }")
+            self.setStyleSheet(self._original_style +
+                             f"\nQTreeWidget {{ border: 2px solid {DRAG_BORDER_COLOR}; background-color: {DRAG_BACKGROUND_COLOR}; }}")
         else:
             super().dragEnterEvent(event)
 
@@ -144,7 +164,7 @@ class SaveAsDialog(QDialog):
         self.layout.addWidget(self.buttons)
 
     def browse(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", ISO_SAVE_FILTER)
         if file_path:
             self.file_path_edit.setText(file_path)
 
@@ -206,11 +226,11 @@ class PropertiesDialog(QDialog):
         volume_group = QGroupBox("Volume Properties")
         volume_layout = QFormLayout()
         self.volume_id_edit = QLineEdit(core.volume_descriptor.get('volume_id', ''))
-        self.volume_id_edit.setToolTip("ISO volume label (max 32 characters)")
-        self.volume_id_edit.setMaxLength(32)
+        self.volume_id_edit.setToolTip(f"ISO volume label (max {MAX_VOLUME_ID_LENGTH} characters)")
+        self.volume_id_edit.setMaxLength(MAX_VOLUME_ID_LENGTH)
         self.system_id_edit = QLineEdit(core.volume_descriptor.get('system_id', ''))
-        self.system_id_edit.setToolTip("System identifier (max 32 characters)")
-        self.system_id_edit.setMaxLength(32)
+        self.system_id_edit.setToolTip(f"System identifier (max {MAX_SYSTEM_ID_LENGTH} characters)")
+        self.system_id_edit.setMaxLength(MAX_SYSTEM_ID_LENGTH)
         volume_layout.addRow("Volume ID:", self.volume_id_edit)
         volume_layout.addRow("System ID:", self.system_id_edit)
         volume_group.setLayout(volume_layout)
@@ -222,7 +242,12 @@ class PropertiesDialog(QDialog):
             detected_boot_layout = QFormLayout()
             # Display info for the first boot entry found
             boot_info = core.extracted_boot_info[0]
-            platform_map = {0: "x86", 1: "PowerPC", 2: "Mac", 0xef: "EFI"}
+            platform_map = {
+                BOOT_PLATFORM_X86: "x86",
+                BOOT_PLATFORM_POWERPC: "PowerPC",
+                BOOT_PLATFORM_MAC: "Mac",
+                BOOT_PLATFORM_EFI: "EFI"
+            }
             platform_str = platform_map.get(boot_info.get('platform_id'), 'Unknown')
 
             detected_boot_layout.addRow(QLabel("Platform:"), QLabel(platform_str))
@@ -379,7 +404,7 @@ class RipDiscDialog(QDialog):
         """
         Opens a file dialog to select the output ISO file.
         """
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", ISO_SAVE_FILTER)
         if file_path:
             self.output_path_edit.setText(file_path)
 
@@ -451,13 +476,13 @@ class ISOEditor(QMainWindow):
     def __init__(self):
         """Initializes the ISOEditor main window."""
         super().__init__()
-        self.setWindowTitle("ISO Editor")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle(APP_NAME)
+        self.setGeometry(100, 100, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         self.core = ISOCore()
         self.tree_item_map = {}
         self.show_hidden = False
         self.recent_files = self.load_recent_files()
-        self.max_recent_files = 10
+        self.max_recent_files = MAX_RECENT_FILES
 
         self.create_menu()
         self.create_main_interface()
@@ -598,10 +623,10 @@ class ISOEditor(QMainWindow):
         self.tree.setHeaderLabels(['Name', 'Size', 'Date Modified', 'Type'])
         self.tree.setToolTip("Drag and drop files or folders here to add them to the ISO.\nRight-click for more options.")
         self.tree.filesDropped.connect(self.handle_drop)
-        self.tree.setColumnWidth(0, 300)
-        self.tree.setColumnWidth(1, 100)
-        self.tree.setColumnWidth(2, 150)
-        self.tree.setColumnWidth(3, 100)
+        self.tree.setColumnWidth(0, TREE_COLUMN_NAME_WIDTH)
+        self.tree.setColumnWidth(1, TREE_COLUMN_SIZE_WIDTH)
+        self.tree.setColumnWidth(2, TREE_COLUMN_DATE_WIDTH)
+        self.tree.setColumnWidth(3, TREE_COLUMN_TYPE_WIDTH)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
         self.tree.setSelectionMode(self.tree.ExtendedSelection)  # Allow multi-selection
@@ -609,14 +634,14 @@ class ISOEditor(QMainWindow):
 
         splitter.addWidget(right_pane)
 
-        splitter.setSizes([250, 550])
+        splitter.setSizes([DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH])
         main_layout.addWidget(splitter)
 
     def create_status_bar(self):
         """Creates the status bar."""
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.update_status("Ready")
+        self.update_status(STATUS_READY)
 
     def update_status(self, message):
         """
@@ -625,13 +650,13 @@ class ISOEditor(QMainWindow):
         Args:
             message (str): The message to display.
         """
-        modified_indicator = " [Modified]" if self.core.iso_modified else ""
+        modified_indicator = STATUS_MODIFIED_SUFFIX if self.core.iso_modified else ""
         self.status_bar.showMessage(f"{message}{modified_indicator}")
 
     def open_iso(self):
         """Opens an ISO file and loads it into the editor."""
         logger.info("Open ISO action triggered.")
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Disc Images (*.iso *.cue);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", ISO_FILE_FILTER)
         if not file_path:
             logger.info("Open ISO dialog cancelled.")
             return
@@ -870,7 +895,7 @@ class ChecksumWorker(QThread):
         try:
             hashes = {'md5': hashlib.md5(), 'sha1': hashlib.sha1(), 'sha256': hashlib.sha256()}
             with open(self.file_path, 'rb') as f:
-                while chunk := f.read(8192):
+                while chunk := f.read(FILE_READ_BUFFER_SIZE):
                     if self._cancelled:
                         logger.info("Checksum calculation cancelled by user")
                         self.finished.emit({}, "Checksum calculation cancelled")
@@ -915,7 +940,8 @@ class RipDiscWorker(QThread):
             process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, encoding='utf-8')
 
             # This is a simplification. A better implementation would get the disc size first.
-            DVD_SIZE_BYTES = 4.7 * 1024 * 1024 * 1024
+            # Using DVD size as the default assumption
+            disc_size_bytes = DVD_SIZE_BYTES
 
             while self._is_running and process.poll() is None:
                 line = process.stderr.readline()
@@ -923,14 +949,14 @@ class RipDiscWorker(QThread):
                     match = re.search(r'(\d+)\s+bytes', line)
                     if match:
                         bytes_copied = int(match.group(1))
-                        percent = int((bytes_copied / DVD_SIZE_BYTES) * 100)
+                        percent = int((bytes_copied / disc_size_bytes) * 100)
                         self.progress.emit(min(percent, 100))
 
             if not self._is_running:
                 logger.info("Rip disc operation cancelled, terminating dd process")
                 process.terminate()
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=PROCESS_TERMINATE_TIMEOUT_SEC)
                 except subprocess.TimeoutExpired:
                     logger.warning("dd process did not terminate gracefully, killing it")
                     process.kill()
@@ -1255,8 +1281,8 @@ class RipDiscWorker(QThread):
 
     def show_about(self):
         """Shows the About dialog."""
-        about_text = """<h2>ISO Editor</h2>
-        <p><b>Version:</b> 1.0.0</p>
+        about_text = f"""<h2>{APP_NAME}</h2>
+        <p><b>Version:</b> {VERSION}</p>
         <p>A comprehensive ISO image editor with support for:</p>
         <ul>
         <li>ISO 9660, Joliet, Rock Ridge, and UDF formats</li>
@@ -1297,9 +1323,9 @@ class RipDiscWorker(QThread):
     def get_recent_files_path(self):
         """Returns the path to the recent files JSON file."""
         home = os.path.expanduser("~")
-        config_dir = os.path.join(home, ".config", "iso-editor")
+        config_dir = os.path.join(home, CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME)
         os.makedirs(config_dir, exist_ok=True)
-        return os.path.join(config_dir, "recent_files.json")
+        return os.path.join(config_dir, RECENT_FILES_FILENAME)
 
     def load_recent_files(self):
         """Loads the list of recent files from disk."""
@@ -1424,7 +1450,7 @@ class RipDiscWorker(QThread):
                 continue
 
             size_text = self.format_file_size(child.get('size', 0)) if not child.get('is_directory') else ''
-            file_type = 'Directory' if child.get('is_directory') else 'File'
+            file_type = ITEM_TYPE_DIRECTORY if child.get('is_directory') else ITEM_TYPE_FILE
             display_name = child.get('name', '')
             if child.get('is_new'):
                 display_name += " [NEW]"
