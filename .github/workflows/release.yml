@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    name: Build and Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install build wheel setuptools twine
+
+    - name: Build package
+      run: |
+        python -m build
+
+    - name: Extract version from tag
+      id: get_version
+      run: |
+        echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+        body: |
+          ## ISO Editor ${{ steps.get_version.outputs.VERSION }}
+
+          ### Changes
+          See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/README.md#changelog) for details.
+
+          ### Installation
+          ```bash
+          pip install iso-editor==${{ steps.get_version.outputs.VERSION }}
+          ```
+
+          Or download the wheel file below and install with:
+          ```bash
+          pip install iso_editor-${{ steps.get_version.outputs.VERSION }}-py3-none-any.whl
+          ```
+
+    - name: Upload wheel to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/iso_editor-${{ steps.get_version.outputs.VERSION }}-py3-none-any.whl
+        asset_name: iso_editor-${{ steps.get_version.outputs.VERSION }}-py3-none-any.whl
+        asset_content_type: application/x-wheel+zip
+
+    - name: Upload source tarball to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/iso-editor-${{ steps.get_version.outputs.VERSION }}.tar.gz
+        asset_name: iso-editor-${{ steps.get_version.outputs.VERSION }}.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Publish to PyPI
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        twine upload dist/*
+      continue-on-error: true

@@ -10,8 +10,12 @@ import pycdlib
 from io import BytesIO
 import posixpath
 from cueparser import CueSheet
+from typing import Dict, List, Optional, Callable, Any, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Type alias for directory tree nodes
+TreeNode = Dict[str, Any]
 
 class ISOCore:
     """
@@ -21,20 +25,21 @@ class ISOCore:
     including loading from an existing ISO, parsing its structure,
     modifying the file tree, and saving it back to a new ISO file.
     """
-    def __init__(self):
+    def __init__(self) -> None:
         """Initializes the ISOCore instance with a new, empty ISO structure."""
-        self.current_iso_path = None
-        self.volume_descriptor = None
-        self.directory_tree = None
-        self.iso_modified = False
-        self.boot_image_path = None
-        self.efi_boot_image_path = None
-        self.boot_emulation_type = 'noemul'
-        self._pycdlib_instance = None
-        self.is_joliet = False
+        self.current_iso_path: Optional[str] = None
+        self.volume_descriptor: Optional[Dict[str, Any]] = None
+        self.directory_tree: Optional[TreeNode] = None
+        self.iso_modified: bool = False
+        self.boot_image_path: Optional[str] = None
+        self.efi_boot_image_path: Optional[str] = None
+        self.boot_emulation_type: str = 'noemul'
+        self._pycdlib_instance: Optional[pycdlib.PyCdlib] = None
+        self.is_joliet: bool = False
+        self.extracted_boot_info: List[Dict[str, Any]] = []
         self.init_new_iso()
 
-    def init_new_iso(self):
+    def init_new_iso(self) -> None:
         """Initializes or resets the core to a new, empty ISO structure."""
         logger.info("Initializing new ISO structure.")
         self.close_iso()
@@ -58,7 +63,7 @@ class ISOCore:
         self.directory_tree['parent'] = self.directory_tree
         self.extracted_boot_info = []
 
-    def close_iso(self):
+    def close_iso(self) -> None:
         """Closes the currently open ISO file handle, if one exists."""
         if self._pycdlib_instance:
             logger.info(f"Closing ISO file: {self.current_iso_path}")
@@ -68,7 +73,7 @@ class ISOCore:
                 logger.error(f"Error closing pycdlib instance: {e}")
             self._pycdlib_instance = None
 
-    def load_iso(self, file_path):
+    def load_iso(self, file_path: str) -> None:
         """
         Loads an ISO file from the given path and parses its structure using pycdlib.
 
@@ -115,7 +120,7 @@ class ISOCore:
                 logger.exception(f"An unexpected error occurred while loading the ISO with pycdlib: {e}")
                 raise ValueError(f"Failed to parse ISO with pycdlib: {e}") from e
 
-    def _load_cue_sheet(self, file_path):
+    def _load_cue_sheet(self, file_path: str) -> None:
         """Builds the internal directory_tree from a CUE sheet."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -177,7 +182,7 @@ class ISOCore:
                 else:
                     track_node['size'] = 0
 
-    def _parse_cue_offset(self, offset_str):
+    def _parse_cue_offset(self, offset_str: str) -> int:
         """Converts a CUE sheet offset string (MM:SS:FF) to bytes."""
         try:
             parts = offset_str.split(':')
@@ -195,7 +200,7 @@ class ISOCore:
             logger.error(f"Could not parse CUE offset string: '{offset_str}'. Error: {e}")
             raise ValueError(f"Invalid CUE offset format: '{offset_str}'") from e
 
-    def _build_tree_from_pycdlib(self):
+    def _build_tree_from_pycdlib(self) -> Optional[TreeNode]:
         """Builds the internal directory_tree structure from the loaded pycdlib instance."""
         if not self._pycdlib_instance:
             return None
@@ -272,7 +277,7 @@ class ISOCore:
                     node_map[item_path] = new_node
         return root_node
 
-    def _format_pycdlib_date(self, pycdlib_date):
+    def _format_pycdlib_date(self, pycdlib_date: Dict[str, int]) -> str:
         """Formats a pycdlib date dictionary into a string."""
         try:
             return (f"{pycdlib_date['year']:04d}-{pycdlib_date['month']:02d}-{pycdlib_date['day']:02d} "
@@ -280,7 +285,9 @@ class ISOCore:
         except (TypeError, KeyError):
             return "Unknown"
 
-    def save_iso(self, output_path, use_joliet, use_rock_ridge, progress_callback=None, make_hybrid=False, use_udf=True):
+    def save_iso(self, output_path: str, use_joliet: bool, use_rock_ridge: bool,
+                 progress_callback: Optional[Callable[[int, int], None]] = None,
+                 make_hybrid: bool = False, use_udf: bool = True) -> None:
         """
         Saves the current in-memory ISO structure to a new file.
 
@@ -315,7 +322,7 @@ class ISOCore:
             logger.exception(f"Failed to save ISO to {output_path}: {e}")
             raise
 
-    def get_file_data(self, node):
+    def get_file_data(self, node: TreeNode) -> bytes:
         """
         Retrieves the data for a given file node.
 
@@ -364,9 +371,10 @@ class ISOCore:
             logger.error(f"Error getting file data for {node.get('name')} using pycdlib: {e}")
             return b''
 
-    def add_file_to_directory(self, file_path, target_node):
+    def add_file_to_directory(self, file_path: str, target_node: TreeNode) -> None:
         """
         Adds a file from the local filesystem to a directory in the ISO structure.
+        For large files (>100MB), stores only the path to stream during save.
 
         Args:
             file_path (str): The path to the local file to add.
@@ -377,24 +385,50 @@ class ISOCore:
 
         logger.info(f"Adding file '{file_path}' to '{self.get_node_path(target_node)}'")
         filename = os.path.basename(file_path)
+
+        # Memory optimization threshold: 100 MB
+        LARGE_FILE_THRESHOLD = 100 * 1024 * 1024
+
         try:
-            with open(file_path, 'rb') as f: file_data = f.read()
             file_stats = os.stat(file_path)
+            file_size = file_stats.st_size
+
+            # For large files, store only the path to stream later
+            if file_size > LARGE_FILE_THRESHOLD:
+                logger.info(f"Large file detected ({file_size} bytes), will stream from disk during save")
+                new_node = {
+                    'name': filename, 'is_directory': False, 'is_hidden': False,
+                    'size': file_size,
+                    'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    'extent_location': 0, 'children': [], 'parent': target_node,
+                    'file_path': file_path,  # Store path instead of data
+                    'file_data': None,  # No data in memory
+                    'is_new': True,
+                    'is_large_file': True  # Flag for streaming
+                }
+            else:
+                # For small files, read into memory as before
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+
+                new_node = {
+                    'name': filename, 'is_directory': False, 'is_hidden': False,
+                    'size': len(file_data),
+                    'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    'extent_location': 0, 'children': [], 'parent': target_node,
+                    'file_data': file_data,
+                    'is_new': True,
+                    'is_large_file': False
+                }
         except (FileNotFoundError, IOError) as e:
             logger.error(f"Error adding file {file_path}: {e}")
             raise IOError(f"File not found or unreadable: {file_path}") from e
 
-        new_node = {
-            'name': filename, 'is_directory': False, 'is_hidden': False,
-            'size': len(file_data), 'date': datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            'extent_location': 0, 'children': [], 'parent': target_node,
-            'file_data': file_data, 'is_new': True
-        }
         target_node['children'] = [c for c in target_node['children'] if c['name'].lower() != filename.lower()]
         target_node['children'].append(new_node)
         self.iso_modified = True
 
-    def add_folder_to_directory(self, folder_name, target_node):
+    def add_folder_to_directory(self, folder_name: str, target_node: TreeNode) -> None:
         """
         Adds a new, empty folder to a directory in the ISO structure.
 
@@ -416,7 +450,7 @@ class ISOCore:
         target_node['children'].append(new_node)
         self.iso_modified = True
 
-    def remove_node(self, node_to_remove):
+    def remove_node(self, node_to_remove: TreeNode) -> None:
         """
         Removes a file or folder node from the directory tree.
 
@@ -446,7 +480,7 @@ class ISOCore:
             # Depending on desired robustness, you might want to re-raise or handle differently
             raise
 
-    def get_node_path(self, node):
+    def get_node_path(self, node: TreeNode) -> str:
         """
         Gets the full path string for a given node in the directory tree.
 
@@ -465,7 +499,7 @@ class ISOCore:
             current = current['parent']
         return '/' + '/'.join(reversed(path_parts)).replace('//', '/')
 
-    def find_non_compliant_filenames(self):
+    def find_non_compliant_filenames(self) -> List[str]:
         """
         Scans the directory tree for filenames that do not comply with the
         strict ISO9660 Level 1 standard.
@@ -496,7 +530,7 @@ class ISOCore:
 
         return list(set(non_compliant_files))
 
-    def _extract_boot_info(self):
+    def _extract_boot_info(self) -> None:
         """
         Extracts boot information from the loaded ISO and populates
         the self.extracted_boot_info list.
@@ -549,7 +583,8 @@ class ISOCore:
                                 if record.inode == boot_inode_num:
                                     boot_image_path = posixpath.join(root, f)
                                     break
-                            except:
+                            except (pycdlib.pycdlibexception.PyCdlibException, AttributeError, KeyError) as e:
+                                logger.debug(f"Could not retrieve record for {posixpath.join(root, f)}: {e}")
                                 continue
                         if boot_image_path != "Unknown":
                             break
@@ -570,25 +605,27 @@ class ISOBuilder:
     """
     Builds an ISO 9660 file from an in-memory directory tree using pycdlib.
     """
-    def __init__(self, root_node, output_path, volume_id="TK_ISO_VOL",
-                 use_joliet=True, use_rock_ridge=True,
-                 boot_image_path=None, efi_boot_image_path=None,
-                 boot_emulation_type='noemul', core=None, progress_callback=None, make_hybrid=False, use_udf=True):
-        self.root_node = root_node
-        self.output_path = output_path
-        self.volume_id = volume_id
-        self.use_joliet = use_joliet
-        self.use_rock_ridge = use_rock_ridge
-        self.boot_image_path = boot_image_path
-        self.efi_boot_image_path = efi_boot_image_path
-        self.boot_emulation_type = boot_emulation_type
-        self.core = core
-        self.progress_callback = progress_callback
-        self.make_hybrid = make_hybrid
-        self.use_udf = use_udf
-        self.iso = pycdlib.PyCdlib()
+    def __init__(self, root_node: TreeNode, output_path: str, volume_id: str = "TK_ISO_VOL",
+                 use_joliet: bool = True, use_rock_ridge: bool = True,
+                 boot_image_path: Optional[str] = None, efi_boot_image_path: Optional[str] = None,
+                 boot_emulation_type: str = 'noemul', core: Optional[ISOCore] = None,
+                 progress_callback: Optional[Callable[[int, int], None]] = None,
+                 make_hybrid: bool = False, use_udf: bool = True) -> None:
+        self.root_node: TreeNode = root_node
+        self.output_path: str = output_path
+        self.volume_id: str = volume_id
+        self.use_joliet: bool = use_joliet
+        self.use_rock_ridge: bool = use_rock_ridge
+        self.boot_image_path: Optional[str] = boot_image_path
+        self.efi_boot_image_path: Optional[str] = efi_boot_image_path
+        self.boot_emulation_type: str = boot_emulation_type
+        self.core: Optional[ISOCore] = core
+        self.progress_callback: Optional[Callable[[int, int], None]] = progress_callback
+        self.make_hybrid: bool = make_hybrid
+        self.use_udf: bool = use_udf
+        self.iso: pycdlib.PyCdlib = pycdlib.PyCdlib()
 
-    def build(self):
+    def build(self) -> None:
         """
         Builds the ISO file and writes it to the output path.
         """
@@ -627,12 +664,28 @@ class ISOBuilder:
                         logger.error(f"Failed to add directory {joliet_path} to ISO: {e}")
                         raise
             else:
-                try:
-                    file_data = self.core.get_file_data(node)
-                    self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
-                except Exception as e:
-                    logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
-                    raise
+                # Check if this is a large file that should be streamed from disk
+                if node.get('is_new') and node.get('is_large_file'):
+                    # Large file - stream directly from disk without loading into memory
+                    file_path = node.get('file_path')
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            logger.debug(f"Streaming large file from {file_path}")
+                            self.iso.add_file(file_path, iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
+                        except Exception as e:
+                            logger.error(f"Failed to add large file {joliet_path} to ISO: {e}")
+                            raise
+                    else:
+                        logger.error(f"Large file path not found for {joliet_path}: {file_path}")
+                        raise FileNotFoundError(f"File not found: {file_path}")
+                else:
+                    # Small file or existing file - use existing approach
+                    try:
+                        file_data = self.core.get_file_data(node)
+                        self.iso.add_fp(BytesIO(file_data), len(file_data), iso9660_path, rr_name=rr_name, joliet_path=current_joliet_path, udf_path=udf_path)
+                    except Exception as e:
+                        logger.error(f"Failed to add file {joliet_path} to ISO: {e}")
+                        raise
 
         if self.boot_image_path or self.efi_boot_image_path:
             self._add_boot_images()
@@ -643,7 +696,7 @@ class ISOBuilder:
         self.iso.close()
         logger.info(f"ISO build process completed successfully. Output at: {self.output_path}")
 
-    def _sanitize_iso9660_name(self, name):
+    def _sanitize_iso9660_name(self, name: str) -> str:
         """
         Sanitizes a filename to be compliant with the basic ISO9660 standard.
         """
@@ -655,7 +708,8 @@ class ISOBuilder:
             return f"{sanitized_base[:8]}.{sanitized_ext[:3]}"
         return sanitized_base[:8]
 
-    def _get_all_nodes_flat(self, node, joliet_path, iso9660_path, udf_path):
+    def _get_all_nodes_flat(self, node: TreeNode, joliet_path: str, iso9660_path: str,
+                            udf_path: str) -> List[Tuple[str, str, str, TreeNode]]:
         """
         Walks the directory tree and returns a flat list of all nodes
         with their full Joliet, ISO9660, and UDF paths.
@@ -672,7 +726,7 @@ class ISOBuilder:
                 nodes.extend(self._get_all_nodes_flat(child, child_joliet_path, child_iso9660_path, child_udf_path))
         return nodes
 
-    def _add_boot_images(self):
+    def _add_boot_images(self) -> None:
         """Adds boot images to the ISO if they exist."""
         logger.info("Adding boot images to the ISO.")
         try:

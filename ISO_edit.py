@@ -4,6 +4,9 @@ import logging
 import glob
 import subprocess
 import re
+import json
+import argparse
+from typing import Optional, List, Dict, Any, Callable
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -11,11 +14,35 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton,
     QProgressDialog, QCheckBox, QComboBox
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtCore import Qt, QPoint, Signal, QThread
 import os
 import traceback
-from iso_logic import ISOCore
+from iso_logic import ISOCore, TreeNode
+from commands import (
+    CommandHistory, AddFileCommand, RemoveNodeCommand,
+    AddFolderCommand, RenameNodeCommand
+)
+from constants import (
+    VERSION, APP_NAME,
+    MAX_VOLUME_ID_LENGTH, MAX_SYSTEM_ID_LENGTH,
+    JOLIET_MAX_FILENAME_LENGTH, MAX_RECENT_FILES,
+    DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH,
+    TREE_COLUMN_NAME_WIDTH, TREE_COLUMN_SIZE_WIDTH,
+    TREE_COLUMN_DATE_WIDTH, TREE_COLUMN_TYPE_WIDTH,
+    FILE_READ_BUFFER_SIZE, DVD_SIZE_BYTES,
+    PROCESS_TERMINATE_TIMEOUT_SEC,
+    DRAG_BORDER_COLOR, DRAG_BACKGROUND_COLOR,
+    BOOT_PLATFORM_X86, BOOT_PLATFORM_POWERPC,
+    BOOT_PLATFORM_MAC, BOOT_PLATFORM_EFI,
+    CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME,
+    RECENT_FILES_FILENAME, SETTINGS_FILENAME, LOG_FILENAME,
+    ISO_FILE_FILTER, ISO_SAVE_FILTER, BOOT_IMAGE_FILTER,
+    STATUS_READY, STATUS_MODIFIED_SUFFIX,
+    ITEM_TYPE_FILE, ITEM_TYPE_DIRECTORY,
+    DEFAULT_LOG_LEVEL, DEFAULT_LOG_FORMAT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +54,7 @@ class DroppableTreeWidget(QTreeWidget):
     """
     filesDropped = Signal(list)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         """
         Initializes the DroppableTreeWidget.
 
@@ -36,8 +63,10 @@ class DroppableTreeWidget(QTreeWidget):
         """
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self._drag_active: bool = False
+        self._original_style: Optional[str] = None
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """
         Handles the drag enter event. Accepts the event if it contains URLs.
 
@@ -46,10 +75,27 @@ class DroppableTreeWidget(QTreeWidget):
         """
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self._drag_active = True
+            if not self._original_style:
+                self._original_style = self.styleSheet()
+            self.setStyleSheet(self._original_style +
+                             f"\nQTreeWidget {{ border: 2px solid {DRAG_BORDER_COLOR}; background-color: {DRAG_BACKGROUND_COLOR}; }}")
         else:
             super().dragEnterEvent(event)
 
-    def dragMoveEvent(self, event):
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        """
+        Handles the drag leave event. Restores original styling.
+
+        Args:
+            event (QDragLeaveEvent): The drag leave event.
+        """
+        self._drag_active = False
+        if self._original_style is not None:
+            self.setStyleSheet(self._original_style)
+        super().dragLeaveEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         """
         Handles the drag move event. Accepts the event if it contains URLs.
 
@@ -61,13 +107,17 @@ class DroppableTreeWidget(QTreeWidget):
         else:
             super().dragMoveEvent(event)
 
-    def dropEvent(self, event):
+    def dropEvent(self, event: QDropEvent) -> None:
         """
         Handles the drop event. Emits a signal with the list of dropped file paths.
 
         Args:
             event (QDropEvent): The drop event.
         """
+        self._drag_active = False
+        if self._original_style is not None:
+            self.setStyleSheet(self._original_style)
+
         if event.mimeData().hasUrls():
             urls = [url.toLocalFile() for url in event.mimeData().urls()]
             if urls:
@@ -80,14 +130,16 @@ class SaveAsDialog(QDialog):
     """
     A dialog for saving an ISO with options for UDF and Hybrid ISO.
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Save ISO As")
         self.layout = QVBoxLayout(self)
 
         form_layout = QFormLayout()
         self.file_path_edit = QLineEdit()
+        self.file_path_edit.setPlaceholderText("Choose output file path...")
         browse_button = QPushButton("Browse...")
+        browse_button.setToolTip("Browse for output file location")
         browse_button.clicked.connect(self.browse)
 
         path_layout = QHBoxLayout()
@@ -98,14 +150,17 @@ class SaveAsDialog(QDialog):
 
         self.udf_checkbox = QCheckBox("Enable UDF Support")
         self.udf_checkbox.setChecked(True)
+        self.udf_checkbox.setToolTip("Universal Disk Format - recommended for better compatibility with modern systems")
         form_layout.addRow(self.udf_checkbox)
 
         self.hybrid_checkbox = QCheckBox("Create Hybrid ISO")
         self.hybrid_checkbox.setChecked(False)
+        self.hybrid_checkbox.setToolTip("Create a hybrid ISO that can boot from both CD/DVD and USB drives")
         form_layout.addRow(self.hybrid_checkbox)
 
         self.checksum_checkbox = QCheckBox("Verify checksums after saving")
         self.checksum_checkbox.setChecked(True)
+        self.checksum_checkbox.setToolTip("Calculate MD5, SHA-1, and SHA-256 checksums after saving for verification")
         form_layout.addRow(self.checksum_checkbox)
 
         self.layout.addLayout(form_layout)
@@ -115,14 +170,45 @@ class SaveAsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         self.layout.addWidget(self.buttons)
 
-    def browse(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+    def browse(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", ISO_SAVE_FILTER)
         if file_path:
             self.file_path_edit.setText(file_path)
 
+    def accept(self) -> None:
+        """Validate input before accepting the dialog."""
+        file_path = self.file_path_edit.text().strip()
+
+        if not file_path:
+            QMessageBox.warning(self, "Invalid Input", "Please specify a file path.")
+            return
+
+        # Validate the directory exists
+        directory = os.path.dirname(file_path)
+        if directory and not os.path.exists(directory):
+            QMessageBox.warning(self, "Invalid Path", f"Directory does not exist:\n{directory}")
+            return
+
+        # Check if directory is writable
+        if directory:
+            test_dir = directory
+        else:
+            test_dir = os.getcwd()
+
+        if not os.access(test_dir, os.W_OK):
+            QMessageBox.warning(self, "Permission Denied", f"Cannot write to directory:\n{test_dir}")
+            return
+
+        # Ensure .iso extension
+        if not file_path.lower().endswith('.iso'):
+            file_path += '.iso'
+            self.file_path_edit.setText(file_path)
+
+        super().accept()
+
     def get_options(self):
         return {
-            'file_path': self.file_path_edit.text(),
+            'file_path': self.file_path_edit.text().strip(),
             'use_udf': self.udf_checkbox.isChecked(),
             'make_hybrid': self.hybrid_checkbox.isChecked(),
             'calculate_checksums': self.checksum_checkbox.isChecked()
@@ -147,7 +233,11 @@ class PropertiesDialog(QDialog):
         volume_group = QGroupBox("Volume Properties")
         volume_layout = QFormLayout()
         self.volume_id_edit = QLineEdit(core.volume_descriptor.get('volume_id', ''))
+        self.volume_id_edit.setToolTip(f"ISO volume label (max {MAX_VOLUME_ID_LENGTH} characters)")
+        self.volume_id_edit.setMaxLength(MAX_VOLUME_ID_LENGTH)
         self.system_id_edit = QLineEdit(core.volume_descriptor.get('system_id', ''))
+        self.system_id_edit.setToolTip(f"System identifier (max {MAX_SYSTEM_ID_LENGTH} characters)")
+        self.system_id_edit.setMaxLength(MAX_SYSTEM_ID_LENGTH)
         volume_layout.addRow("Volume ID:", self.volume_id_edit)
         volume_layout.addRow("System ID:", self.system_id_edit)
         volume_group.setLayout(volume_layout)
@@ -159,7 +249,12 @@ class PropertiesDialog(QDialog):
             detected_boot_layout = QFormLayout()
             # Display info for the first boot entry found
             boot_info = core.extracted_boot_info[0]
-            platform_map = {0: "x86", 1: "PowerPC", 2: "Mac", 0xef: "EFI"}
+            platform_map = {
+                BOOT_PLATFORM_X86: "x86",
+                BOOT_PLATFORM_POWERPC: "PowerPC",
+                BOOT_PLATFORM_MAC: "Mac",
+                BOOT_PLATFORM_EFI: "EFI"
+            }
             platform_str = platform_map.get(boot_info.get('platform_id'), 'Unknown')
 
             detected_boot_layout.addRow(QLabel("Platform:"), QLabel(platform_str))
@@ -174,7 +269,10 @@ class PropertiesDialog(QDialog):
 
         # BIOS Boot Image
         self.boot_image_edit = QLineEdit(core.boot_image_path or '')
+        self.boot_image_edit.setPlaceholderText("Path to BIOS boot image (.img, .bin)...")
+        self.boot_image_edit.setToolTip("El Torito boot image for BIOS systems (typically boot.img)")
         bios_browse_button = QPushButton("Browse...")
+        bios_browse_button.setToolTip("Browse for BIOS boot image file")
         bios_browse_button.clicked.connect(lambda: self.browse_for_image(self.boot_image_edit, "Select BIOS Boot Image"))
         bios_boot_layout = QHBoxLayout()
         bios_boot_layout.addWidget(self.boot_image_edit)
@@ -184,13 +282,17 @@ class PropertiesDialog(QDialog):
         # Emulation Type
         self.emulation_combo = QComboBox()
         self.emulation_combo.addItems(['noemul', 'floppy', 'hdemul'])
+        self.emulation_combo.setToolTip("Boot emulation mode:\n• noemul: No emulation (recommended)\n• floppy: Floppy disk emulation\n• hdemul: Hard disk emulation")
         current_emulation = core.boot_emulation_type or 'noemul'
         self.emulation_combo.setCurrentText(current_emulation)
         boot_form_layout.addRow("Emulation Type:", self.emulation_combo)
 
         # EFI Boot Image
         self.efi_boot_image_edit = QLineEdit(core.efi_boot_image_path or '')
+        self.efi_boot_image_edit.setPlaceholderText("Path to EFI boot image...")
+        self.efi_boot_image_edit.setToolTip("EFI boot image for UEFI systems (typically efiboot.img)")
         efi_browse_button = QPushButton("Browse...")
+        efi_browse_button.setToolTip("Browse for EFI boot image file")
         efi_browse_button.clicked.connect(lambda: self.browse_for_image(self.efi_boot_image_edit, "Select EFI Boot Image"))
         efi_boot_layout = QHBoxLayout()
         efi_boot_layout.addWidget(self.efi_boot_image_edit)
@@ -211,12 +313,54 @@ class PropertiesDialog(QDialog):
         if file_path:
             line_edit.setText(file_path)
 
+    def accept(self):
+        """Validate input before accepting the dialog."""
+        volume_id = self.volume_id_edit.text().strip()
+        system_id = self.system_id_edit.text().strip()
+
+        # Validate volume ID
+        if not volume_id:
+            QMessageBox.warning(self, "Invalid Input", "Volume ID cannot be empty.")
+            return
+
+        if len(volume_id) > 32:
+            QMessageBox.warning(self, "Invalid Input", "Volume ID must be 32 characters or less.")
+            return
+
+        # Validate system ID
+        if len(system_id) > 32:
+            QMessageBox.warning(self, "Invalid Input", "System ID must be 32 characters or less.")
+            return
+
+        # Validate boot image paths if provided
+        boot_path = self.boot_image_edit.text().strip()
+        if boot_path and not os.path.exists(boot_path):
+            reply = QMessageBox.question(
+                self, "File Not Found",
+                f"BIOS boot image file not found:\n{boot_path}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        efi_path = self.efi_boot_image_edit.text().strip()
+        if efi_path and not os.path.exists(efi_path):
+            reply = QMessageBox.question(
+                self, "File Not Found",
+                f"EFI boot image file not found:\n{efi_path}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        super().accept()
+
     def get_properties(self):
         return {
-            'volume_id': self.volume_id_edit.text(),
-            'system_id': self.system_id_edit.text(),
-            'boot_image_path': self.boot_image_edit.text(),
-            'efi_boot_image_path': self.efi_boot_image_edit.text(),
+            'volume_id': self.volume_id_edit.text().strip(),
+            'system_id': self.system_id_edit.text().strip(),
+            'boot_image_path': self.boot_image_edit.text().strip(),
+            'efi_boot_image_path': self.efi_boot_image_edit.text().strip(),
             'boot_emulation_type': self.emulation_combo.currentText()
         }
 
@@ -267,9 +411,58 @@ class RipDiscDialog(QDialog):
         """
         Opens a file dialog to select the output ISO file.
         """
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", "ISO Files (*.iso)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", ISO_SAVE_FILTER)
         if file_path:
             self.output_path_edit.setText(file_path)
+
+    def accept(self):
+        """Validate input before accepting the dialog."""
+        if not self.drive_combo.isEnabled():
+            QMessageBox.warning(self, "No Drives", "No optical drives were found.")
+            return
+
+        drive = self.drive_combo.currentText()
+        if not drive or "No drives found" in drive:
+            QMessageBox.warning(self, "No Drive Selected", "Please select a valid optical drive.")
+            return
+
+        output_path = self.output_path_edit.text().strip()
+        if not output_path:
+            QMessageBox.warning(self, "Invalid Input", "Please specify an output file path.")
+            return
+
+        # Validate the directory exists
+        directory = os.path.dirname(output_path)
+        if directory and not os.path.exists(directory):
+            QMessageBox.warning(self, "Invalid Path", f"Directory does not exist:\n{directory}")
+            return
+
+        # Check if directory is writable
+        if directory:
+            test_dir = directory
+        else:
+            test_dir = os.getcwd()
+
+        if not os.access(test_dir, os.W_OK):
+            QMessageBox.warning(self, "Permission Denied", f"Cannot write to directory:\n{test_dir}")
+            return
+
+        # Ensure .iso extension
+        if not output_path.lower().endswith('.iso'):
+            output_path += '.iso'
+            self.output_path_edit.setText(output_path)
+
+        # Check if drive is accessible
+        if not os.path.exists(drive):
+            reply = QMessageBox.question(
+                self, "Drive Not Accessible",
+                f"Cannot access drive:\n{drive}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        super().accept()
 
     def get_rip_options(self):
         """
@@ -279,7 +472,7 @@ class RipDiscDialog(QDialog):
             return None
         return {
             'drive': self.drive_combo.currentText(),
-            'output_path': self.output_path_edit.text()
+            'output_path': self.output_path_edit.text().strip()
         }
 
 
@@ -290,15 +483,20 @@ class ISOEditor(QMainWindow):
     def __init__(self):
         """Initializes the ISOEditor main window."""
         super().__init__()
-        self.setWindowTitle("ISO Editor")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle(APP_NAME)
+        self.setGeometry(100, 100, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         self.core = ISOCore()
+        self.command_history = CommandHistory(max_history=50)
         self.tree_item_map = {}
         self.show_hidden = False
+        self.dark_mode = False
+        self.recent_files = self.load_recent_files()
+        self.max_recent_files = MAX_RECENT_FILES
 
         self.create_menu()
         self.create_main_interface()
         self.create_status_bar()
+        self.restore_window_state()
         self.refresh_view()
 
     def create_menu(self):
@@ -309,65 +507,148 @@ class ISOEditor(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
 
         new_action = QAction("&New ISO...", self)
+        new_action.setShortcut("Ctrl+N")
+        new_action.setStatusTip("Create a new empty ISO image")
         new_action.triggered.connect(self.new_iso)
         file_menu.addAction(new_action)
 
         open_action = QAction("&Open ISO...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.setStatusTip("Open an existing ISO or CUE file")
         open_action.triggered.connect(self.open_iso)
         file_menu.addAction(open_action)
 
+        # Recent Files submenu
+        self.recent_menu = file_menu.addMenu("Recent &Files")
+        self.update_recent_files_menu()
+
         if IS_LINUX:
             rip_disc_action = QAction("Create ISO from &Disc...", self)
+            rip_disc_action.setShortcut("Ctrl+D")
+            rip_disc_action.setStatusTip("Create an ISO image from an optical disc")
             rip_disc_action.triggered.connect(self.rip_disc)
             file_menu.addAction(rip_disc_action)
 
         file_menu.addSeparator()
 
         save_action = QAction("&Save ISO", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.setStatusTip("Save the current ISO image")
         save_action.triggered.connect(self.save_iso)
         file_menu.addAction(save_action)
 
         save_as_action = QAction("Save ISO &As...", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.setStatusTip("Save the ISO image with a new name or options")
         save_as_action.triggered.connect(self.save_iso_as)
         file_menu.addAction(save_as_action)
 
         file_menu.addSeparator()
 
         exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.setStatusTip("Exit the application")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
         # Edit Menu
         edit_menu = menu_bar.addMenu("&Edit")
+
+        # Undo/Redo actions
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.setStatusTip("Undo the last action")
+        self.undo_action.triggered.connect(self.undo)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcut("Ctrl+Shift+Z")
+        self.redo_action.setStatusTip("Redo the last undone action")
+        self.redo_action.triggered.connect(self.redo)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
+
+        edit_menu.addSeparator()
+
         add_file_action = QAction("Add &File...", self)
+        add_file_action.setShortcut("Ctrl+F")
+        add_file_action.setStatusTip("Add a file to the ISO image")
         add_file_action.triggered.connect(self.add_file)
         edit_menu.addAction(add_file_action)
 
         add_folder_action = QAction("Add F&older...", self)
+        add_folder_action.setShortcut("Ctrl+Shift+F")
+        add_folder_action.setStatusTip("Create a new folder in the ISO image")
         add_folder_action.triggered.connect(self.add_folder)
         edit_menu.addAction(add_folder_action)
 
         import_dir_action = QAction("&Import Directory...", self)
+        import_dir_action.setShortcut("Ctrl+I")
+        import_dir_action.setStatusTip("Import an entire directory tree into the ISO")
         import_dir_action.triggered.connect(self.import_directory)
         edit_menu.addAction(import_dir_action)
 
         edit_menu.addSeparator()
 
         remove_action = QAction("&Remove Selected", self)
+        remove_action.setShortcut("Delete")
+        remove_action.setStatusTip("Remove the selected file or folder")
         remove_action.triggered.connect(self.remove_selected)
         edit_menu.addAction(remove_action)
 
         edit_menu.addSeparator()
 
         properties_action = QAction("ISO &Properties...", self)
+        properties_action.setShortcut("Alt+Return")
+        properties_action.setStatusTip("Edit ISO properties such as volume ID and boot options")
         properties_action.triggered.connect(self.show_iso_properties)
         edit_menu.addAction(properties_action)
 
         # View Menu
         view_menu = menu_bar.addMenu("&View")
+
+        find_action = QAction("&Find...", self)
+        find_action.setShortcut("Ctrl+F")
+        find_action.setStatusTip("Focus the search box to filter files")
+        find_action.triggered.connect(self.focus_search)
+        view_menu.addAction(find_action)
+
+        view_menu.addSeparator()
+
         refresh_action = QAction("&Refresh", self)
+        refresh_action.setShortcut("F5")
+        refresh_action.setStatusTip("Refresh the file tree view")
         refresh_action.triggered.connect(self.refresh_view)
         view_menu.addAction(refresh_action)
+
+        view_menu.addSeparator()
+
+        # Dark Mode toggle
+        self.dark_mode_action = QAction("&Dark Mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setStatusTip("Toggle dark mode theme")
+        self.dark_mode_action.triggered.connect(self.toggle_dark_mode)
+        view_menu.addAction(self.dark_mode_action)
+
+        view_menu.addSeparator()
+
+        statistics_action = QAction("ISO &Statistics...", self)
+        statistics_action.setStatusTip("Show ISO statistics and file breakdown")
+        statistics_action.triggered.connect(self.show_statistics)
+        view_menu.addAction(statistics_action)
+
+        export_list_action = QAction("&Export File List...", self)
+        export_list_action.setStatusTip("Export ISO file list to CSV or TXT")
+        export_list_action.triggered.connect(self.export_file_list)
+        view_menu.addAction(export_list_action)
+
+        # Help Menu
+        help_menu = menu_bar.addMenu("&Help")
+        about_action = QAction("&About ISO Editor...", self)
+        about_action.setStatusTip("About this application")
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
 
     def create_main_interface(self):
         """Creates the main user interface of the application."""
@@ -375,7 +656,7 @@ class ISOEditor(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
 
         # Left pane
         left_pane = QGroupBox("ISO Properties")
@@ -390,33 +671,362 @@ class ISOEditor(QMainWindow):
         left_layout.addWidget(self.volume_name_label)
         left_layout.addStretch()
 
-        splitter.addWidget(left_pane)
+        self.splitter.addWidget(left_pane)
 
         # Right pane
         right_pane = QGroupBox("ISO Contents")
         right_layout = QVBoxLayout(right_pane)
 
+        # Search bar
+        search_layout = QHBoxLayout()
+        search_label = QLabel("Search:")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter files and folders...")
+        self.search_input.textChanged.connect(self.filter_tree)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setToolTip("Filter tree by name (Ctrl+F to focus)")
+
+        self.case_sensitive_checkbox = QCheckBox("Case sensitive")
+        self.case_sensitive_checkbox.stateChanged.connect(self.filter_tree)
+        self.case_sensitive_checkbox.setToolTip("Enable case-sensitive search")
+
+        self.regex_checkbox = QCheckBox("Regex")
+        self.regex_checkbox.stateChanged.connect(self.filter_tree)
+        self.regex_checkbox.setToolTip("Enable regular expression search")
+
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.case_sensitive_checkbox)
+        search_layout.addWidget(self.regex_checkbox)
+        right_layout.addLayout(search_layout)
+
         self.tree = DroppableTreeWidget()
         self.tree.setHeaderLabels(['Name', 'Size', 'Date Modified', 'Type'])
+        self.tree.setToolTip("Drag and drop files or folders here to add them to the ISO.\nRight-click for more options.")
         self.tree.filesDropped.connect(self.handle_drop)
-        self.tree.setColumnWidth(0, 300)
-        self.tree.setColumnWidth(1, 100)
-        self.tree.setColumnWidth(2, 150)
-        self.tree.setColumnWidth(3, 100)
+        self.tree.setColumnWidth(0, TREE_COLUMN_NAME_WIDTH)
+        self.tree.setColumnWidth(1, TREE_COLUMN_SIZE_WIDTH)
+        self.tree.setColumnWidth(2, TREE_COLUMN_DATE_WIDTH)
+        self.tree.setColumnWidth(3, TREE_COLUMN_TYPE_WIDTH)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        self.tree.setSelectionMode(self.tree.ExtendedSelection)  # Allow multi-selection
         right_layout.addWidget(self.tree)
 
-        splitter.addWidget(right_pane)
+        self.splitter.addWidget(right_pane)
 
-        splitter.setSizes([250, 550])
-        main_layout.addWidget(splitter)
+        self.splitter.setSizes([DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH])
+        main_layout.addWidget(self.splitter)
+
+    def undo(self):
+        """Undo the last command."""
+        description = self.command_history.undo()
+        if description:
+            self.refresh_view()
+            self.update_undo_redo_actions()
+            self.update_status(f"Undone: {description}")
+            logger.info(f"Undone: {description}")
+
+    def redo(self):
+        """Redo the last undone command."""
+        description = self.command_history.redo()
+        if description:
+            self.refresh_view()
+            self.update_undo_redo_actions()
+            self.update_status(f"Redone: {description}")
+            logger.info(f"Redone: {description}")
+
+    def update_undo_redo_actions(self):
+        """Update the enabled state and tooltips of undo/redo actions."""
+        # Update undo action
+        can_undo = self.command_history.can_undo()
+        self.undo_action.setEnabled(can_undo)
+        if can_undo:
+            desc = self.command_history.get_undo_description()
+            self.undo_action.setStatusTip(f"Undo: {desc}")
+        else:
+            self.undo_action.setStatusTip("Undo the last action")
+
+        # Update redo action
+        can_redo = self.command_history.can_redo()
+        self.redo_action.setEnabled(can_redo)
+        if can_redo:
+            desc = self.command_history.get_redo_description()
+            self.redo_action.setStatusTip(f"Redo: {desc}")
+        else:
+            self.redo_action.setStatusTip("Redo the last undone action")
+
+    def toggle_dark_mode(self):
+        """Toggle between dark and light mode."""
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        self.save_window_state()
+        mode_name = "dark" if self.dark_mode else "light"
+        self.update_status(f"Switched to {mode_name} mode")
+        logger.info(f"Theme changed to {mode_name} mode")
+
+    def apply_theme(self):
+        """Apply the current theme (dark or light)."""
+        if self.dark_mode:
+            self.setStyleSheet(self.get_dark_stylesheet())
+        else:
+            self.setStyleSheet("")  # Reset to default light theme
+
+    def get_dark_stylesheet(self) -> str:
+        """Get the dark mode stylesheet."""
+        return """
+            /* Dark Mode Stylesheet */
+            QMainWindow, QDialog, QWidget {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+            }
+
+            /* Menu Bar */
+            QMenuBar {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border-bottom: 1px solid #3c3c3c;
+            }
+            QMenuBar::item:selected {
+                background-color: #3c3c3c;
+            }
+
+            /* Menus */
+            QMenu {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+            }
+            QMenu::item:selected {
+                background-color: #3c3c3c;
+            }
+
+            /* Status Bar */
+            QStatusBar {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border-top: 1px solid #3c3c3c;
+            }
+
+            /* Tree Widget */
+            QTreeWidget {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #37373d;
+                alternate-background-color: #252526;
+            }
+            QTreeWidget::item:hover {
+                background-color: #2a2d2e;
+            }
+            QTreeWidget::item:selected {
+                background-color: #37373d;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                padding: 4px;
+            }
+
+            /* Buttons */
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #4c4c4c;
+                border-radius: 4px;
+                padding: 5px 15px;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #2b2b2b;
+            }
+            QPushButton:disabled {
+                background-color: #2b2b2b;
+                color: #6e6e6e;
+            }
+
+            /* Line Edit */
+            QLineEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                padding: 4px;
+                selection-background-color: #264f78;
+            }
+            QLineEdit:focus {
+                border: 1px solid #007acc;
+            }
+
+            /* Text Edit */
+            QTextEdit, QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+
+            /* Combo Box */
+            QComboBox {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #4c4c4c;
+                border-radius: 3px;
+                padding: 4px;
+            }
+            QComboBox:hover {
+                background-color: #505050;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3c3c3c;
+            }
+            QComboBox::down-arrow {
+                image: url(none);
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid #d4d4d4;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                selection-background-color: #37373d;
+                border: 1px solid #3c3c3c;
+            }
+
+            /* Check Box */
+            QCheckBox {
+                color: #d4d4d4;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #4c4c4c;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #007acc;
+                border-color: #007acc;
+            }
+
+            /* Group Box */
+            QGroupBox {
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 1ex;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                color: #d4d4d4;
+            }
+
+            /* Label */
+            QLabel {
+                color: #d4d4d4;
+            }
+
+            /* Scroll Bar */
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #5a5a5a;
+                min-height: 20px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #6a6a6a;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #5a5a5a;
+                min-width: 20px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #6a6a6a;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+
+            /* Splitter */
+            QSplitter::handle {
+                background-color: #3c3c3c;
+            }
+            QSplitter::handle:hover {
+                background-color: #505050;
+            }
+
+            /* Progress Dialog */
+            QProgressDialog {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+            }
+            QProgressBar {
+                background-color: #1e1e1e;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                text-align: center;
+                color: #d4d4d4;
+            }
+            QProgressBar::chunk {
+                background-color: #007acc;
+            }
+
+            /* Message Box */
+            QMessageBox {
+                background-color: #2b2b2b;
+            }
+            QMessageBox QLabel {
+                color: #d4d4d4;
+            }
+
+            /* Tab Widget */
+            QTabWidget::pane {
+                border: 1px solid #3c3c3c;
+                background-color: #1e1e1e;
+            }
+            QTabBar::tab {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                padding: 5px 10px;
+            }
+            QTabBar::tab:selected {
+                background-color: #1e1e1e;
+                border-bottom-color: #1e1e1e;
+            }
+            QTabBar::tab:hover {
+                background-color: #3c3c3c;
+            }
+        """
 
     def create_status_bar(self):
         """Creates the status bar."""
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.update_status("Ready")
+        self.update_status(STATUS_READY)
 
     def update_status(self, message):
         """
@@ -425,25 +1035,139 @@ class ISOEditor(QMainWindow):
         Args:
             message (str): The message to display.
         """
-        modified_indicator = " [Modified]" if self.core.iso_modified else ""
+        modified_indicator = STATUS_MODIFIED_SUFFIX if self.core.iso_modified else ""
         self.status_bar.showMessage(f"{message}{modified_indicator}")
+
+    def focus_search(self):
+        """Focuses the search input box."""
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def filter_tree(self):
+        """Filters the tree view based on search text."""
+        search_text = self.search_input.text()
+
+        if not search_text:
+            # Show all items if search is empty
+            self._set_all_items_visible(True)
+            return
+
+        case_sensitive = self.case_sensitive_checkbox.isChecked()
+        use_regex = self.regex_checkbox.isChecked()
+
+        # Prepare search pattern
+        if use_regex:
+            try:
+                import re
+                flags = 0 if case_sensitive else re.IGNORECASE
+                pattern = re.compile(search_text, flags)
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern: {e}")
+                self.update_status(f"Invalid regex: {e}")
+                return
+        else:
+            pattern = search_text if case_sensitive else search_text.lower()
+
+        # Filter items
+        self._filter_tree_items(self.tree.invisibleRootItem(), pattern, use_regex, case_sensitive)
+
+    def _set_all_items_visible(self, visible):
+        """Sets visibility for all tree items."""
+        def set_visible_recursive(item):
+            item.setHidden(not visible)
+            for i in range(item.childCount()):
+                set_visible_recursive(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            set_visible_recursive(root.child(i))
+
+    def _filter_tree_items(self, parent_item, pattern, use_regex, case_sensitive):
+        """
+        Recursively filters tree items based on pattern.
+        Returns True if this item or any child matches.
+        """
+        any_child_visible = False
+
+        for i in range(parent_item.childCount()):
+            child = parent_item.child(i)
+            child_name = child.text(0).replace(" [NEW]", "")  # Remove [NEW] tag for matching
+
+            # Check if this item matches
+            if use_regex:
+                matches = bool(pattern.search(child_name))
+            else:
+                search_name = child_name if case_sensitive else child_name.lower()
+                matches = pattern in search_name
+
+            # Recursively check children
+            child_has_visible_children = self._filter_tree_items(child, pattern, use_regex, case_sensitive)
+
+            # Show item if it matches or has visible children
+            should_show = matches or child_has_visible_children
+            child.setHidden(not should_show)
+
+            if should_show:
+                any_child_visible = True
+
+        return any_child_visible
 
     def open_iso(self):
         """Opens an ISO file and loads it into the editor."""
         logger.info("Open ISO action triggered.")
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Disc Images (*.iso *.cue);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", ISO_FILE_FILTER)
         if not file_path:
             logger.info("Open ISO dialog cancelled.")
             return
-        try:
-            self.core.load_iso(file_path)
-            self.refresh_view()
-            self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
-            logger.info(f"Successfully loaded ISO: {file_path}")
-        except Exception as e:
-            logger.exception(f"Failed to load ISO: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
-            self.update_status("Error loading ISO")
+
+        self._load_iso_with_progress(file_path)
+
+    def _load_iso_with_progress(self, file_path):
+        """Loads an ISO file with progress dialog."""
+        self.load_progress_dialog = QProgressDialog("Loading ISO...", "Cancel", 0, 100, self)
+        self.load_progress_dialog.setWindowTitle("Loading")
+        self.load_progress_dialog.setWindowModality(Qt.WindowModal)
+        self.load_progress_dialog.setAutoClose(True)
+        self.load_progress_dialog.setMinimumDuration(0)  # Show immediately
+
+        self.load_thread = LoadWorker(self.core, file_path)
+        self.load_thread.progress.connect(self.update_load_progress)
+        self.load_thread.finished.connect(lambda: self.load_finished(file_path))
+        self.load_thread.error.connect(self.load_error)
+        self.load_progress_dialog.canceled.connect(self.cancel_load)
+
+        self.load_thread.start()
+        self.load_progress_dialog.exec()
+
+    def update_load_progress(self, value, message):
+        """Updates the load progress dialog."""
+        self.load_progress_dialog.setValue(value)
+        self.load_progress_dialog.setLabelText(message)
+
+    def cancel_load(self):
+        """Cancels the load operation."""
+        if hasattr(self, 'load_thread') and self.load_thread.isRunning():
+            self.load_thread.cancel()
+            self.load_thread.wait()  # Wait for thread to finish
+            self.update_status("Load cancelled by user")
+            logger.info("ISO load cancelled by user")
+
+    def load_finished(self, file_path):
+        """Called when ISO load completes successfully."""
+        self.load_progress_dialog.setValue(100)
+        self.command_history.clear()
+        self.refresh_view()
+        self.update_undo_redo_actions()
+        self.add_to_recent_files(file_path)
+        self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
+        logger.info(f"Successfully loaded ISO: {file_path}")
+
+    def load_error(self, error_message):
+        """Called when ISO load fails."""
+        self.load_progress_dialog.close()
+        logger.error(f"Failed to load ISO: {error_message}")
+        QMessageBox.critical(self, "Error Loading ISO", error_message)
+        self.update_status("Error loading ISO")
 
     def new_iso(self):
         """Creates a new, empty ISO."""
@@ -459,7 +1183,9 @@ class ISOEditor(QMainWindow):
                 if self.core.iso_modified: # If save was cancelled
                     return
         self.core.init_new_iso()
+        self.command_history.clear()
         self.refresh_view()
+        self.update_undo_redo_actions()
         self.update_status("Created new empty ISO.")
         logger.info("New empty ISO created.")
 
@@ -533,8 +1259,8 @@ class ISOEditor(QMainWindow):
 
     def cancel_save(self):
         if self.save_thread.isRunning():
-            self.save_thread.terminate()
-            self.update_status("Save cancelled.")
+            self.save_thread.cancel()
+            self.update_status("Cancelling save operation...")
 
     def save_finished(self, file_path):
         self.progress_dialog.setValue(100)
@@ -613,23 +1339,35 @@ class SaveWorker(QThread):
     finished = Signal(str)
     error = Signal(str)
 
-    def __init__(self, core, file_path, use_udf, make_hybrid):
+    def __init__(self, core: ISOCore, file_path: str, use_udf: bool, make_hybrid: bool) -> None:
         super().__init__()
-        self.core = core
-        self.file_path = file_path
-        self.use_udf = use_udf
-        self.make_hybrid = make_hybrid
+        self.core: ISOCore = core
+        self.file_path: str = file_path
+        self.use_udf: bool = use_udf
+        self.make_hybrid: bool = make_hybrid
+        self._cancelled: bool = False
 
-    def run(self):
+    def cancel(self) -> None:
+        """Request cancellation of the save operation."""
+        self._cancelled = True
+
+    def run(self) -> None:
         try:
             # The progress callback for pycdlib's write method
             def progress_cb(done, total, opaque):
+                if self._cancelled:
+                    raise InterruptedError("Save operation cancelled by user")
                 percent = (done * 100) // total
                 self.progress.emit(percent)
 
             self.core.save_iso(self.file_path, use_joliet=True, use_rock_ridge=True, progress_callback=progress_cb, use_udf=self.use_udf, make_hybrid=self.make_hybrid)
-            self.finished.emit(self.file_path)
+            if not self._cancelled:
+                self.finished.emit(self.file_path)
+        except InterruptedError as e:
+            logger.info(f"Save operation cancelled: {e}")
+            self.error.emit("Save cancelled by user")
         except Exception as e:
+            logger.exception(f"Error during save operation: {e}")
             self.error.emit(str(e))
 
 
@@ -641,26 +1379,134 @@ class ChecksumWorker(QThread):
     #           str:  Error message if something goes wrong.
     finished = Signal(dict, str)
 
-    def __init__(self, file_path):
+    def __init__(self, file_path: str) -> None:
         super().__init__()
-        self.file_path = file_path
+        self.file_path: str = file_path
+        self._cancelled: bool = False
 
-    def run(self):
+    def cancel(self) -> None:
+        """Request cancellation of the checksum calculation."""
+        self._cancelled = True
+
+    def run(self) -> None:
         """
         Calculates MD5, SHA1, and SHA256 hashes for the file.
         """
         try:
             hashes = {'md5': hashlib.md5(), 'sha1': hashlib.sha1(), 'sha256': hashlib.sha256()}
             with open(self.file_path, 'rb') as f:
-                while chunk := f.read(8192):
+                while chunk := f.read(FILE_READ_BUFFER_SIZE):
+                    if self._cancelled:
+                        logger.info("Checksum calculation cancelled by user")
+                        self.finished.emit({}, "Checksum calculation cancelled")
+                        return
                     for h in hashes.values():
                         h.update(chunk)
 
-            results = {name: h.hexdigest() for name, h in hashes.items()}
-            self.finished.emit(results, "")
+            if not self._cancelled:
+                results = {name: h.hexdigest() for name, h in hashes.items()}
+                self.finished.emit(results, "")
         except Exception as e:
             logger.error(f"Checksum calculation failed for {self.file_path}: {e}")
             self.finished.emit({}, f"Failed to calculate checksums: {e}")
+
+
+class LoadWorker(QThread):
+    """
+    A QThread worker for loading ISO files in the background with progress reporting.
+    """
+    progress = Signal(int, str)  # percent, status message
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, core: ISOCore, file_path: str) -> None:
+        super().__init__()
+        self.core: ISOCore = core
+        self.file_path: str = file_path
+        self._cancelled: bool = False
+
+    def cancel(self) -> None:
+        """Request cancellation of the load operation."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        """Load the ISO with progress updates."""
+        try:
+            self.progress.emit(10, "Opening ISO file...")
+            if self._cancelled:
+                return
+
+            # Initialize
+            self.core.init_new_iso()
+
+            _, extension = os.path.splitext(self.file_path)
+
+            if extension.lower() == '.cue':
+                self.progress.emit(30, "Parsing CUE sheet...")
+                if self._cancelled:
+                    return
+
+                self.core._load_cue_sheet(self.file_path)
+                self.core.current_iso_path = self.file_path
+                self.core.iso_modified = False
+                self.progress.emit(100, "Complete")
+
+            else:
+                # Load regular ISO
+                import pycdlib
+
+                self.progress.emit(25, "Reading ISO structure...")
+                if self._cancelled:
+                    return
+
+                iso = pycdlib.PyCdlib()
+                iso.open(self.file_path)
+
+                self.progress.emit(50, "Reading volume information...")
+                if self._cancelled:
+                    return
+
+                self.core._pycdlib_instance = iso
+                self.core.current_iso_path = self.file_path
+                self.core.is_joliet = iso.has_joliet()
+
+                if self.core.is_joliet and iso.joliet_vd:
+                    self.core.volume_descriptor['volume_id'] = iso.joliet_vd.volume_identifier.decode('utf-16-be', 'ignore').strip()
+                    self.core.volume_descriptor['system_id'] = iso.joliet_vd.system_identifier.decode('utf-16-be', 'ignore').strip()
+                elif iso.pvd:
+                    self.core.volume_descriptor['volume_id'] = iso.pvd.volume_identifier.decode('ascii', 'ignore').strip()
+                    self.core.volume_descriptor['system_id'] = iso.pvd.system_identifier.decode('ascii', 'ignore').strip()
+
+                self.progress.emit(75, "Building directory tree...")
+                if self._cancelled:
+                    return
+
+                self.core.directory_tree = self.core._build_tree_from_pycdlib()
+
+                self.progress.emit(90, "Extracting boot information...")
+                if self._cancelled:
+                    return
+
+                self.core._extract_boot_info()
+                self.core.iso_modified = False
+
+                self.progress.emit(100, "Complete")
+
+            if not self._cancelled:
+                self.finished.emit()
+
+        except FileNotFoundError:
+            self.core.init_new_iso()
+            logger.error(f"ISO file not found at path: {self.file_path}")
+            self.error.emit(f"ISO file not found:\n{self.file_path}\n\nPossible solutions:\n• Check if the file exists\n• Verify you have read permissions\n• Check if the path is correct")
+        except PermissionError:
+            self.core.init_new_iso()
+            logger.error(f"Permission denied accessing ISO: {self.file_path}")
+            self.error.emit(f"Permission denied:\n{self.file_path}\n\nPossible solutions:\n• Check file permissions\n• Try running with appropriate privileges\n• Check if the file is locked by another application")
+        except Exception as e:
+            self.core.init_new_iso()
+            logger.exception(f"An unexpected error occurred while loading the ISO: {e}")
+            self.error.emit(f"Failed to load ISO:\n{str(e)}\n\nPossible solutions:\n• Verify the file is a valid ISO or CUE file\n• Check if the file is corrupted\n• Try opening with another ISO tool to verify\n• Check available disk space")
 
 
 class RipDiscWorker(QThread):
@@ -670,13 +1516,13 @@ class RipDiscWorker(QThread):
     progress = Signal(int) # Percentage
     finished = Signal(str) # Error message (if any)
 
-    def __init__(self, source_drive, dest_path):
+    def __init__(self, source_drive: str, dest_path: str) -> None:
         super().__init__()
-        self.source_drive = source_drive
-        self.dest_path = dest_path
-        self._is_running = True
+        self.source_drive: str = source_drive
+        self.dest_path: str = dest_path
+        self._is_running: bool = True
 
-    def run(self):
+    def run(self) -> None:
         """
         Executes the dd command to rip the disc.
         """
@@ -692,7 +1538,8 @@ class RipDiscWorker(QThread):
             process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, encoding='utf-8')
 
             # This is a simplification. A better implementation would get the disc size first.
-            DVD_SIZE_BYTES = 4.7 * 1024 * 1024 * 1024
+            # Using DVD size as the default assumption
+            disc_size_bytes = DVD_SIZE_BYTES
 
             while self._is_running and process.poll() is None:
                 line = process.stderr.readline()
@@ -700,11 +1547,27 @@ class RipDiscWorker(QThread):
                     match = re.search(r'(\d+)\s+bytes', line)
                     if match:
                         bytes_copied = int(match.group(1))
-                        percent = int((bytes_copied / DVD_SIZE_BYTES) * 100)
+                        percent = int((bytes_copied / disc_size_bytes) * 100)
                         self.progress.emit(min(percent, 100))
 
             if not self._is_running:
+                logger.info("Rip disc operation cancelled, terminating dd process")
                 process.terminate()
+                try:
+                    process.wait(timeout=PROCESS_TERMINATE_TIMEOUT_SEC)
+                except subprocess.TimeoutExpired:
+                    logger.warning("dd process did not terminate gracefully, killing it")
+                    process.kill()
+                    process.wait()
+
+                # Clean up partial output file
+                if os.path.exists(self.dest_path):
+                    try:
+                        os.remove(self.dest_path)
+                        logger.info(f"Removed partial output file: {self.dest_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to remove partial output file: {e}")
+
                 self.finished.emit("Ripping cancelled by user.")
                 return
 
@@ -749,6 +1612,7 @@ class RipDiscWorker(QThread):
             logger.info("Add Files dialog cancelled.")
             return
 
+        success_count = 0
         for fp in file_paths:
             try:
                 if any(c['name'].lower() == os.path.basename(fp).lower() for c in target_node['children']):
@@ -756,13 +1620,18 @@ class RipDiscWorker(QThread):
                                                    QMessageBox.Yes | QMessageBox.No)
                     if reply == QMessageBox.No:
                         continue
-                self.core.add_file_to_directory(fp, target_node)
+
+                # Use command for undo/redo support
+                cmd = AddFileCommand(self.core, fp, target_node)
+                if self.command_history.execute(cmd):
+                    success_count += 1
             except Exception as e:
                 logger.exception(f"Failed to add file {fp}: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to add file {os.path.basename(fp)}: {e}")
 
         self.refresh_view()
-        self.update_status(f"Added {len(file_paths)} file(s)")
+        self.update_undo_redo_actions()
+        self.update_status(f"Added {success_count} file(s)")
 
     def add_folder(self):
         """Adds a folder to the ISO."""
@@ -782,9 +1651,12 @@ class RipDiscWorker(QThread):
                 QMessageBox.warning(self, "Folder Exists", f"A folder with the name '{folder_name}' already exists.")
                 return
 
-            self.core.add_folder_to_directory(folder_name, target_node)
-            self.refresh_view()
-            self.update_status(f"Added folder: {folder_name}")
+            # Use command for undo/redo support
+            cmd = AddFolderCommand(self.core, folder_name, target_node)
+            if self.command_history.execute(cmd):
+                self.refresh_view()
+                self.update_undo_redo_actions()
+                self.update_status(f"Added folder: {folder_name}")
         except Exception as e:
             logger.exception(f"Failed to add folder: {e}")
             QMessageBox.critical(self, "Error", f"An unexpected error occurred while adding the folder: {e}")
@@ -804,9 +1676,12 @@ class RipDiscWorker(QThread):
 
             if reply == QMessageBox.Yes:
                 logger.info(f"User confirmed removal of node: {node_name}")
-                self.core.remove_node(node)
-                self.refresh_view()
-                self.update_status(f"Removed '{node_name}'")
+                # Use command for undo/redo support
+                cmd = RemoveNodeCommand(self.core, node)
+                if self.command_history.execute(cmd):
+                    self.refresh_view()
+                    self.update_undo_redo_actions()
+                    self.update_status(f"Removed '{node_name}'")
             else:
                 logger.info(f"User cancelled removal of node: {node_name}")
         except Exception as e:
@@ -970,22 +1845,202 @@ class RipDiscWorker(QThread):
         """
         item = self.tree.itemAt(position)
         if not item:
+            # Show context menu for empty area
+            context_menu = QMenu(self)
+            new_folder_action = context_menu.addAction("New Folder...")
+            context_menu.addSeparator()
+            add_file_action = context_menu.addAction("Add File...")
+            add_folder_action = context_menu.addAction("Add Folder...")
+            import_dir_action = context_menu.addAction("Import Directory...")
+
+            action = context_menu.exec(self.tree.mapToGlobal(position))
+
+            if action == new_folder_action:
+                self.add_folder()
+            elif action == add_file_action:
+                self.add_file()
+            elif action == add_folder_action:
+                self.add_folder()
+            elif action == import_dir_action:
+                self.import_directory()
             return
 
         node = self.tree_item_map.get(id(item))
         if not node:
             return
 
+        is_directory = node.get('is_directory', False)
+
         context_menu = QMenu(self)
+
+        # Add common actions
+        rename_action = context_menu.addAction("Rename...")
+        properties_action = context_menu.addAction("Properties...")
+        copy_path_action = context_menu.addAction("Copy Path")
+
+        context_menu.addSeparator()
+
+        # Directory-specific actions
+        if is_directory:
+            new_folder_here_action = context_menu.addAction("New Folder Here...")
+            add_file_here_action = context_menu.addAction("Add File Here...")
+            context_menu.addSeparator()
+
         extract_action = context_menu.addAction("Extract...")
+
+        context_menu.addSeparator()
         remove_action = context_menu.addAction("Remove")
 
         action = context_menu.exec(self.tree.mapToGlobal(position))
 
-        if action == extract_action:
+        if action == rename_action:
+            self.rename_node(node, item)
+        elif action == properties_action:
+            self.show_node_properties(node)
+        elif action == copy_path_action:
+            self.copy_node_path(node)
+        elif is_directory and action == new_folder_here_action:
+            self.add_folder_to_node(node)
+        elif is_directory and action == add_file_here_action:
+            self.add_file_to_node(node)
+        elif action == extract_action:
             self.extract_selected()
         elif action == remove_action:
             self.remove_selected()
+
+    def rename_node(self, node, item):
+        """Renames a file or folder in the ISO."""
+        old_name = node['name']
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", f"Enter new name for '{old_name}':",
+            text=old_name
+        )
+
+        if ok and new_name and new_name != old_name:
+            # Validate the new name
+            if '/' in new_name or '\\' in new_name:
+                QMessageBox.warning(self, "Invalid Name", "Name cannot contain slashes.")
+                return
+
+            # Check for duplicates
+            parent = node.get('parent')
+            if parent:
+                for sibling in parent['children']:
+                    if sibling != node and sibling['name'].lower() == new_name.lower():
+                        QMessageBox.warning(self, "Duplicate Name",
+                                          f"An item with the name '{new_name}' already exists.")
+                        return
+
+            # Use command for undo/redo support
+            cmd = RenameNodeCommand(node, old_name, new_name)
+            if self.command_history.execute(cmd):
+                self.core.iso_modified = True
+
+                # Update the tree item
+                item.setText(0, new_name + (" [NEW]" if node.get('is_new') else ""))
+                self.update_status(f"Renamed '{old_name}' to '{new_name}'")
+                self.update_undo_redo_actions()
+                logger.info(f"Renamed node from '{old_name}' to '{new_name}'")
+
+    def show_node_properties(self, node):
+        """Shows properties dialog for a file or folder."""
+        name = node['name']
+        is_dir = node.get('is_directory', False)
+        node_type = "Directory" if is_dir else "File"
+
+        properties_text = f"<h3>{name}</h3>"
+        properties_text += f"<p><b>Type:</b> {node_type}</p>"
+
+        if not is_dir:
+            size = node.get('size', 0)
+            properties_text += f"<p><b>Size:</b> {self.format_file_size(size)} ({size:,} bytes)</p>"
+
+        date = node.get('date', 'Unknown')
+        properties_text += f"<p><b>Date Modified:</b> {date}</p>"
+
+        path = self.core.get_node_path(node)
+        properties_text += f"<p><b>Path:</b> {path}</p>"
+
+        if node.get('is_new'):
+            properties_text += f"<p><b>Status:</b> <i>New (not yet saved)</i></p>"
+
+        if is_dir:
+            # Count children
+            def count_items(n):
+                total_files = 0
+                total_dirs = 0
+                total_size = 0
+                for child in n.get('children', []):
+                    if child.get('is_directory'):
+                        total_dirs += 1
+                        f, d, s = count_items(child)
+                        total_files += f
+                        total_dirs += d
+                        total_size += s
+                    else:
+                        total_files += 1
+                        total_size += child.get('size', 0)
+                return total_files, total_dirs, total_size
+
+            files, dirs, size = count_items(node)
+            properties_text += f"<p><b>Contains:</b> {files} file(s), {dirs} folder(s)</p>"
+            properties_text += f"<p><b>Total Size:</b> {self.format_file_size(size)} ({size:,} bytes)</p>"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Properties")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(properties_text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec()
+
+    def copy_node_path(self, node):
+        """Copies the ISO path of a node to the clipboard."""
+        path = self.core.get_node_path(node)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(path)
+        self.update_status(f"Copied path to clipboard: {path}")
+        logger.debug(f"Copied path to clipboard: {path}")
+
+    def add_folder_to_node(self, target_node):
+        """Adds a new folder to the specified node."""
+        folder_name, ok = QInputDialog.getText(
+            self, "New Folder", "Enter folder name:"
+        )
+
+        if ok and folder_name:
+            # Validate folder name
+            if '/' in folder_name or '\\' in folder_name:
+                QMessageBox.warning(self, "Invalid Name", "Folder name cannot contain slashes.")
+                return
+
+            # Check for duplicates
+            for child in target_node['children']:
+                if child['name'].lower() == folder_name.lower():
+                    QMessageBox.warning(self, "Duplicate Name",
+                                      f"A folder with the name '{folder_name}' already exists.")
+                    return
+
+            self.core.add_folder_to_directory(folder_name, target_node)
+            self.refresh_view()
+            self.update_status(f"Added folder '{folder_name}'")
+            logger.info(f"Added folder '{folder_name}' to {self.core.get_node_path(target_node)}")
+
+    def add_file_to_node(self, target_node):
+        """Adds a file to the specified node."""
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Files to Add", "")
+        if not file_paths:
+            return
+
+        for file_path in file_paths:
+            try:
+                self.core.add_file_to_directory(file_path, target_node)
+                logger.info(f"Added file {os.path.basename(file_path)} to {self.core.get_node_path(target_node)}")
+            except Exception as e:
+                logger.exception(f"Failed to add file {file_path}: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to add {os.path.basename(file_path)}: {e}")
+
+        self.refresh_view()
+        self.update_status(f"Added {len(file_paths)} file(s)")
 
     def show_iso_properties(self):
         """Shows the ISO properties dialog."""
@@ -1013,6 +2068,354 @@ class RipDiscWorker(QThread):
                 self.core.boot_emulation_type = new_props['boot_emulation_type']
                 self.core.iso_modified = True
                 self.refresh_view()
+
+    def show_about(self):
+        """Shows the About dialog."""
+        about_text = f"""<h2>{APP_NAME}</h2>
+        <p><b>Version:</b> {VERSION}</p>
+        <p>A comprehensive ISO image editor with support for:</p>
+        <ul>
+        <li>ISO 9660, Joliet, Rock Ridge, and UDF formats</li>
+        <li>El Torito bootable images (BIOS and EFI)</li>
+        <li>Hybrid ISOs for USB booting</li>
+        <li>CUE/BIN disc image format</li>
+        <li>Disc ripping (Linux)</li>
+        </ul>
+        <p><b>Built with:</b> Python, PySide6, pycdlib</p>
+        <p>© 2024 ISO Editor Team</p>
+        """
+        QMessageBox.about(self, "About ISO Editor", about_text)
+
+    def show_statistics(self):
+        """Shows ISO statistics dialog."""
+        if not self.core.directory_tree or not self.core.volume_descriptor:
+            QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
+            return
+
+        # Calculate statistics
+        stats = self._calculate_statistics(self.core.directory_tree)
+
+        # Build statistics text
+        stats_text = f"""<h2>ISO Statistics</h2>
+
+<h3>Overview</h3>
+<table>
+<tr><td><b>Total Files:</b></td><td>{stats['total_files']:,}</td></tr>
+<tr><td><b>Total Folders:</b></td><td>{stats['total_folders']:,}</td></tr>
+<tr><td><b>Total Size:</b></td><td>{self.format_file_size(stats['total_size'])} ({stats['total_size']:,} bytes)</td></tr>
+</table>
+
+<h3>File Types</h3>
+<table>
+"""
+        # Show top file types
+        for ext, data in sorted(stats['by_extension'].items(), key=lambda x: x[1]['size'], reverse=True)[:10]:
+            stats_text += f"<tr><td><b>{ext if ext else '(no extension)'}:</b></td><td>{data['count']} file(s), {self.format_file_size(data['size'])}</td></tr>\n"
+
+        stats_text += "</table>\n\n<h3>Largest Files</h3>\n<table>\n"
+
+        # Show top 10 largest files
+        for name, size in stats['largest_files'][:10]:
+            stats_text += f"<tr><td><b>{name}:</b></td><td>{self.format_file_size(size)}</td></tr>\n"
+
+        stats_text += "</table>"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("ISO Statistics")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(stats_text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec()
+
+    def _calculate_statistics(self, node):
+        """Recursively calculates statistics for the ISO."""
+        stats = {
+            'total_files': 0,
+            'total_folders': 0,
+            'total_size': 0,
+            'by_extension': {},  # ext -> {count, size}
+            'largest_files': []  # list of (name, size)
+        }
+
+        def process_node(n):
+            if n.get('is_directory'):
+                stats['total_folders'] += 1
+                for child in n.get('children', []):
+                    process_node(child)
+            else:
+                stats['total_files'] += 1
+                size = n.get('size', 0)
+                stats['total_size'] += size
+
+                # Track by extension
+                name = n.get('name', '')
+                ext = os.path.splitext(name)[1].lower() if '.' in name else ''
+                if ext not in stats['by_extension']:
+                    stats['by_extension'][ext] = {'count': 0, 'size': 0}
+                stats['by_extension'][ext]['count'] += 1
+                stats['by_extension'][ext]['size'] += size
+
+                # Track largest files
+                stats['largest_files'].append((name, size))
+
+        process_node(node)
+
+        # Sort largest files
+        stats['largest_files'].sort(key=lambda x: x[1], reverse=True)
+
+        return stats
+
+    def export_file_list(self):
+        """Exports the file list to CSV or TXT."""
+        if not self.core.directory_tree or not self.core.volume_descriptor:
+            QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
+            return
+
+        # Ask user for format and location
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export File List",
+            "file_list.csv",
+            "CSV Files (*.csv);;Text Files (*.txt)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            is_csv = file_path.endswith('.csv') or 'CSV' in selected_filter
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                if is_csv:
+                    f.write("Path,Name,Type,Size (bytes),Size (formatted),Date Modified\n")
+                else:
+                    f.write("ISO File List\n")
+                    f.write("=" * 80 + "\n\n")
+
+                self._write_file_list(f, self.core.directory_tree, "", is_csv)
+
+            QMessageBox.information(self, "Success",
+                                  f"File list exported successfully to:\n{file_path}")
+            logger.info(f"Exported file list to {file_path}")
+
+        except Exception as e:
+            logger.exception(f"Failed to export file list: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to export file list:\n{str(e)}")
+
+    def _write_file_list(self, file, node, parent_path, is_csv):
+        """Recursively writes the file list."""
+        for child in node.get('children', []):
+            name = child.get('name', '')
+            is_dir = child.get('is_directory', False)
+            size = child.get('size', 0) if not is_dir else 0
+            date = child.get('date', '')
+            node_type = ITEM_TYPE_DIRECTORY if is_dir else ITEM_TYPE_FILE
+            path = parent_path + "/" + name
+
+            if is_csv:
+                # CSV format
+                size_formatted = self.format_file_size(size) if not is_dir else ""
+                file.write(f'"{path}","{name}","{node_type}",{size},"{size_formatted}","{date}"\n')
+            else:
+                # Text format
+                indent = "  " * parent_path.count("/")
+                type_marker = "[D]" if is_dir else "[F]"
+                size_str = self.format_file_size(size) if not is_dir else ""
+                file.write(f"{indent}{type_marker} {name:<40} {size_str:>15} {date}\n")
+
+            if is_dir:
+                self._write_file_list(file, child, path, is_csv)
+
+    def closeEvent(self, event):
+        """Handle window close event - check for unsaved changes."""
+        if self.core.iso_modified:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Do you want to save before exiting?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+
+            if reply == QMessageBox.Save:
+                self.save_iso()
+                # Check if save was successful (user might have cancelled)
+                if self.core.iso_modified:
+                    event.ignore()
+                    return
+            elif reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+
+        # Save window state before closing
+        self.save_window_state()
+
+        # Clean up resources
+        self.core.close_iso()
+        event.accept()
+
+    def get_recent_files_path(self):
+        """Returns the path to the recent files JSON file."""
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(home, CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME)
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, RECENT_FILES_FILENAME)
+
+    def load_recent_files(self):
+        """Loads the list of recent files from disk."""
+        try:
+            recent_path = self.get_recent_files_path()
+            if os.path.exists(recent_path):
+                with open(recent_path, 'r') as f:
+                    files = json.load(f)
+                    # Filter out files that no longer exist
+                    return [f for f in files if os.path.exists(f)]
+            return []
+        except Exception as e:
+            logger.error(f"Failed to load recent files: {e}")
+            return []
+
+    def save_recent_files(self):
+        """Saves the list of recent files to disk."""
+        try:
+            recent_path = self.get_recent_files_path()
+            with open(recent_path, 'w') as f:
+                json.dump(self.recent_files, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save recent files: {e}")
+
+    def add_to_recent_files(self, file_path):
+        """Adds a file to the recent files list."""
+        # Remove if already in list
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        # Add to front
+        self.recent_files.insert(0, file_path)
+        # Limit to max_recent_files
+        self.recent_files = self.recent_files[:self.max_recent_files]
+        self.save_recent_files()
+        self.update_recent_files_menu()
+
+    def update_recent_files_menu(self):
+        """Updates the Recent Files menu with current items."""
+        self.recent_menu.clear()
+
+        if not self.recent_files:
+            no_recent_action = QAction("No recent files", self)
+            no_recent_action.setEnabled(False)
+            self.recent_menu.addAction(no_recent_action)
+        else:
+            for i, file_path in enumerate(self.recent_files):
+                # Show just the filename, but store full path
+                display_name = f"{i+1}. {os.path.basename(file_path)}"
+                action = QAction(display_name, self)
+                action.setStatusTip(file_path)
+                action.setData(file_path)
+                action.triggered.connect(lambda checked=False, fp=file_path: self.open_recent_file(fp))
+                self.recent_menu.addAction(action)
+
+            self.recent_menu.addSeparator()
+            clear_action = QAction("Clear Recent Files", self)
+            clear_action.triggered.connect(self.clear_recent_files)
+            self.recent_menu.addAction(clear_action)
+
+    def open_recent_file(self, file_path):
+        """Opens a file from the recent files list."""
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "File Not Found",
+                              f"The file no longer exists:\n{file_path}\n\nPossible solutions:\n• Check if the file was moved or deleted\n• Verify the file path\n• Remove from recent files list")
+            self.recent_files.remove(file_path)
+            self.save_recent_files()
+            self.update_recent_files_menu()
+            return
+
+        self._load_iso_with_progress(file_path)
+
+    def clear_recent_files(self):
+        """Clears the recent files list."""
+        self.recent_files = []
+        self.save_recent_files()
+        self.update_recent_files_menu()
+
+    def get_settings_path(self):
+        """Returns the path to the settings JSON file."""
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(home, CONFIG_DIR_NAME, CONFIG_SUBDIR_NAME)
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, SETTINGS_FILENAME)
+
+    def load_settings(self):
+        """Loads application settings from disk."""
+        try:
+            settings_path = self.get_settings_path()
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+            return {}
+
+    def save_settings(self, settings):
+        """Saves application settings to disk."""
+        try:
+            settings_path = self.get_settings_path()
+            with open(settings_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+
+    def restore_window_state(self):
+        """Restores window geometry and splitter state from saved settings."""
+        settings = self.load_settings()
+
+        # Restore window geometry
+        geometry = settings.get('window_geometry')
+        if geometry:
+            try:
+                self.setGeometry(
+                    geometry.get('x', 100),
+                    geometry.get('y', 100),
+                    geometry.get('width', DEFAULT_WINDOW_WIDTH),
+                    geometry.get('height', DEFAULT_WINDOW_HEIGHT)
+                )
+                logger.debug(f"Restored window geometry: {geometry}")
+            except Exception as e:
+                logger.warning(f"Failed to restore window geometry: {e}")
+
+        # Restore window state (maximized, etc.)
+        if settings.get('window_maximized', False):
+            self.showMaximized()
+
+        # Restore splitter state
+        splitter_sizes = settings.get('splitter_sizes')
+        if splitter_sizes and len(splitter_sizes) == 2:
+            try:
+                self.splitter.setSizes(splitter_sizes)
+                logger.debug(f"Restored splitter sizes: {splitter_sizes}")
+            except Exception as e:
+                logger.warning(f"Failed to restore splitter sizes: {e}")
+
+        # Restore dark mode setting
+        self.dark_mode = settings.get('dark_mode', False)
+        self.dark_mode_action.setChecked(self.dark_mode)
+        self.apply_theme()
+        logger.debug(f"Restored dark mode: {self.dark_mode}")
+
+    def save_window_state(self):
+        """Saves current window geometry, splitter state, and dark mode preference to settings."""
+        geometry = self.geometry()
+        settings = {
+            'window_geometry': {
+                'x': geometry.x(),
+                'y': geometry.y(),
+                'width': geometry.width(),
+                'height': geometry.height()
+            },
+            'window_maximized': self.isMaximized(),
+            'splitter_sizes': self.splitter.sizes(),
+            'dark_mode': self.dark_mode
+        }
+        self.save_settings(settings)
+        logger.debug("Saved window state")
 
     def refresh_view(self):
         """Refreshes the tree view to show the current state of the ISO."""
@@ -1052,7 +2455,7 @@ class RipDiscWorker(QThread):
                 continue
 
             size_text = self.format_file_size(child.get('size', 0)) if not child.get('is_directory') else ''
-            file_type = 'Directory' if child.get('is_directory') else 'File'
+            file_type = ITEM_TYPE_DIRECTORY if child.get('is_directory') else ITEM_TYPE_FILE
             display_name = child.get('name', '')
             if child.get('is_new'):
                 display_name += " [NEW]"
@@ -1093,17 +2496,118 @@ class RipDiscWorker(QThread):
             size /= 1024.0
         return f"{size:.1f} TB"
 
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog='iso-editor',
+        description=f'{APP_NAME} - A comprehensive ISO image editor',
+        epilog=f'Version {VERSION}',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'{APP_NAME} {VERSION}'
+    )
+
+    parser.add_argument(
+        'file',
+        nargs='?',
+        help='ISO or CUE file to open on startup'
+    )
+
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        default=DEFAULT_LOG_LEVEL,
+        help=f'Set the logging level (default: {DEFAULT_LOG_LEVEL})'
+    )
+
+    parser.add_argument(
+        '--log-file',
+        default=LOG_FILENAME,
+        help=f'Set the log file path (default: {LOG_FILENAME})'
+    )
+
+    parser.add_argument(
+        '--no-log-file',
+        action='store_true',
+        help='Disable logging to file (log to console only)'
+    )
+
+    return parser.parse_args()
+
+
+def setup_logging(log_level, log_file=None):
+    """
+    Configure application logging.
+
+    Args:
+        log_level (str): The logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file (str, optional): Path to log file. If None, logs to console only.
+    """
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        numeric_level = getattr(logging, DEFAULT_LOG_LEVEL)
+
+    handlers = []
+
+    # Always add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(DEFAULT_LOG_FORMAT))
+    handlers.append(console_handler)
+
+    # Add file handler if log_file is specified
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='w')
+            file_handler.setFormatter(logging.Formatter(DEFAULT_LOG_FORMAT))
+            handlers.append(file_handler)
+        except (IOError, OSError) as e:
+            print(f"Warning: Could not create log file '{log_file}': {e}", file=sys.stderr)
+
+    logging.basicConfig(
+        level=numeric_level,
+        format=DEFAULT_LOG_FORMAT,
+        handlers=handlers
+    )
+
+
 def main():
     """The main entry point of the application."""
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        filename='iso_editor.log',
-                        filemode='w')
-    logger.info("Application starting...")
-    app = QApplication(sys.argv)
-    editor = ISOEditor()
-    editor.show()
-    sys.exit(app.exec())
+    args = parse_arguments()
+
+    # Setup logging based on arguments
+    log_file = None if args.no_log_file else args.log_file
+    setup_logging(args.log_level, log_file)
+
+    logger.info(f"{APP_NAME} version {VERSION} starting...")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {sys.platform}")
+    logger.info(f"Log level: {args.log_level}")
+
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+        app.setApplicationVersion(VERSION)
+
+        editor = ISOEditor()
+        editor.show()
+
+        # Open file if specified on command line (after showing window)
+        if args.file:
+            logger.info(f"Opening file from command line: {args.file}")
+            editor._load_iso_with_progress(args.file)
+
+        logger.info("Application window shown, entering main event loop...")
+        sys.exit(app.exec())
+
+    except Exception as e:
+        logger.exception(f"Fatal error in main: {e}")
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,30 @@
+# Include documentation
+include README.md
+include README.windows.md
+include LICENSE
+
+# Include requirements
+include requirements.txt
+
+# Include scripts
+include *.sh
+include *.cmake
+
+# Include test files
+recursive-include tests *.py
+
+# Exclude compiled and temporary files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude *.log
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *~
+
+# Exclude build artifacts
+prune build
+prune dist
+prune *.egg-info
+prune venv
+prune .venv
