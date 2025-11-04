@@ -6,6 +6,7 @@ import subprocess
 import re
 import json
 import argparse
+from typing import Optional, List, Dict, Any, Callable
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -13,11 +14,11 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout, QPushButton,
     QProgressDialog, QCheckBox, QComboBox
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtCore import Qt, QPoint, Signal, QThread
 import os
 import traceback
-from iso_logic import ISOCore
+from iso_logic import ISOCore, TreeNode
 from constants import (
     VERSION, APP_NAME,
     MAX_VOLUME_ID_LENGTH, MAX_SYSTEM_ID_LENGTH,
@@ -49,7 +50,7 @@ class DroppableTreeWidget(QTreeWidget):
     """
     filesDropped = Signal(list)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         """
         Initializes the DroppableTreeWidget.
 
@@ -58,10 +59,10 @@ class DroppableTreeWidget(QTreeWidget):
         """
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self._drag_active = False
-        self._original_style = None
+        self._drag_active: bool = False
+        self._original_style: Optional[str] = None
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """
         Handles the drag enter event. Accepts the event if it contains URLs.
 
@@ -78,7 +79,7 @@ class DroppableTreeWidget(QTreeWidget):
         else:
             super().dragEnterEvent(event)
 
-    def dragLeaveEvent(self, event):
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
         """
         Handles the drag leave event. Restores original styling.
 
@@ -90,7 +91,7 @@ class DroppableTreeWidget(QTreeWidget):
             self.setStyleSheet(self._original_style)
         super().dragLeaveEvent(event)
 
-    def dragMoveEvent(self, event):
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         """
         Handles the drag move event. Accepts the event if it contains URLs.
 
@@ -102,7 +103,7 @@ class DroppableTreeWidget(QTreeWidget):
         else:
             super().dragMoveEvent(event)
 
-    def dropEvent(self, event):
+    def dropEvent(self, event: QDropEvent) -> None:
         """
         Handles the drop event. Emits a signal with the list of dropped file paths.
 
@@ -125,7 +126,7 @@ class SaveAsDialog(QDialog):
     """
     A dialog for saving an ISO with options for UDF and Hybrid ISO.
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Save ISO As")
         self.layout = QVBoxLayout(self)
@@ -165,12 +166,12 @@ class SaveAsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         self.layout.addWidget(self.buttons)
 
-    def browse(self):
+    def browse(self) -> None:
         file_path, _ = QFileDialog.getSaveFileName(self, "Save ISO As", "", ISO_SAVE_FILTER)
         if file_path:
             self.file_path_edit.setText(file_path)
 
-    def accept(self):
+    def accept(self) -> None:
         """Validate input before accepting the dialog."""
         file_path = self.file_path_edit.text().strip()
 
@@ -781,16 +782,53 @@ class ISOEditor(QMainWindow):
         if not file_path:
             logger.info("Open ISO dialog cancelled.")
             return
-        try:
-            self.core.load_iso(file_path)
-            self.refresh_view()
-            self.add_to_recent_files(file_path)
-            self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
-            logger.info(f"Successfully loaded ISO: {file_path}")
-        except Exception as e:
-            logger.exception(f"Failed to load ISO: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
-            self.update_status("Error loading ISO")
+
+        self._load_iso_with_progress(file_path)
+
+    def _load_iso_with_progress(self, file_path):
+        """Loads an ISO file with progress dialog."""
+        self.load_progress_dialog = QProgressDialog("Loading ISO...", "Cancel", 0, 100, self)
+        self.load_progress_dialog.setWindowTitle("Loading")
+        self.load_progress_dialog.setWindowModality(Qt.WindowModal)
+        self.load_progress_dialog.setAutoClose(True)
+        self.load_progress_dialog.setMinimumDuration(0)  # Show immediately
+
+        self.load_thread = LoadWorker(self.core, file_path)
+        self.load_thread.progress.connect(self.update_load_progress)
+        self.load_thread.finished.connect(lambda: self.load_finished(file_path))
+        self.load_thread.error.connect(self.load_error)
+        self.load_progress_dialog.canceled.connect(self.cancel_load)
+
+        self.load_thread.start()
+        self.load_progress_dialog.exec()
+
+    def update_load_progress(self, value, message):
+        """Updates the load progress dialog."""
+        self.load_progress_dialog.setValue(value)
+        self.load_progress_dialog.setLabelText(message)
+
+    def cancel_load(self):
+        """Cancels the load operation."""
+        if hasattr(self, 'load_thread') and self.load_thread.isRunning():
+            self.load_thread.cancel()
+            self.load_thread.wait()  # Wait for thread to finish
+            self.update_status("Load cancelled by user")
+            logger.info("ISO load cancelled by user")
+
+    def load_finished(self, file_path):
+        """Called when ISO load completes successfully."""
+        self.load_progress_dialog.setValue(100)
+        self.refresh_view()
+        self.add_to_recent_files(file_path)
+        self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
+        logger.info(f"Successfully loaded ISO: {file_path}")
+
+    def load_error(self, error_message):
+        """Called when ISO load fails."""
+        self.load_progress_dialog.close()
+        logger.error(f"Failed to load ISO: {error_message}")
+        QMessageBox.critical(self, "Error Loading ISO", error_message)
+        self.update_status("Error loading ISO")
 
     def new_iso(self):
         """Creates a new, empty ISO."""
@@ -960,19 +998,19 @@ class SaveWorker(QThread):
     finished = Signal(str)
     error = Signal(str)
 
-    def __init__(self, core, file_path, use_udf, make_hybrid):
+    def __init__(self, core: ISOCore, file_path: str, use_udf: bool, make_hybrid: bool) -> None:
         super().__init__()
-        self.core = core
-        self.file_path = file_path
-        self.use_udf = use_udf
-        self.make_hybrid = make_hybrid
-        self._cancelled = False
+        self.core: ISOCore = core
+        self.file_path: str = file_path
+        self.use_udf: bool = use_udf
+        self.make_hybrid: bool = make_hybrid
+        self._cancelled: bool = False
 
-    def cancel(self):
+    def cancel(self) -> None:
         """Request cancellation of the save operation."""
         self._cancelled = True
 
-    def run(self):
+    def run(self) -> None:
         try:
             # The progress callback for pycdlib's write method
             def progress_cb(done, total, opaque):
@@ -1000,16 +1038,16 @@ class ChecksumWorker(QThread):
     #           str:  Error message if something goes wrong.
     finished = Signal(dict, str)
 
-    def __init__(self, file_path):
+    def __init__(self, file_path: str) -> None:
         super().__init__()
-        self.file_path = file_path
-        self._cancelled = False
+        self.file_path: str = file_path
+        self._cancelled: bool = False
 
-    def cancel(self):
+    def cancel(self) -> None:
         """Request cancellation of the checksum calculation."""
         self._cancelled = True
 
-    def run(self):
+    def run(self) -> None:
         """
         Calculates MD5, SHA1, and SHA256 hashes for the file.
         """
@@ -1032,6 +1070,104 @@ class ChecksumWorker(QThread):
             self.finished.emit({}, f"Failed to calculate checksums: {e}")
 
 
+class LoadWorker(QThread):
+    """
+    A QThread worker for loading ISO files in the background with progress reporting.
+    """
+    progress = Signal(int, str)  # percent, status message
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, core: ISOCore, file_path: str) -> None:
+        super().__init__()
+        self.core: ISOCore = core
+        self.file_path: str = file_path
+        self._cancelled: bool = False
+
+    def cancel(self) -> None:
+        """Request cancellation of the load operation."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        """Load the ISO with progress updates."""
+        try:
+            self.progress.emit(10, "Opening ISO file...")
+            if self._cancelled:
+                return
+
+            # Initialize
+            self.core.init_new_iso()
+
+            _, extension = os.path.splitext(self.file_path)
+
+            if extension.lower() == '.cue':
+                self.progress.emit(30, "Parsing CUE sheet...")
+                if self._cancelled:
+                    return
+
+                self.core._load_cue_sheet(self.file_path)
+                self.core.current_iso_path = self.file_path
+                self.core.iso_modified = False
+                self.progress.emit(100, "Complete")
+
+            else:
+                # Load regular ISO
+                import pycdlib
+
+                self.progress.emit(25, "Reading ISO structure...")
+                if self._cancelled:
+                    return
+
+                iso = pycdlib.PyCdlib()
+                iso.open(self.file_path)
+
+                self.progress.emit(50, "Reading volume information...")
+                if self._cancelled:
+                    return
+
+                self.core._pycdlib_instance = iso
+                self.core.current_iso_path = self.file_path
+                self.core.is_joliet = iso.has_joliet()
+
+                if self.core.is_joliet and iso.joliet_vd:
+                    self.core.volume_descriptor['volume_id'] = iso.joliet_vd.volume_identifier.decode('utf-16-be', 'ignore').strip()
+                    self.core.volume_descriptor['system_id'] = iso.joliet_vd.system_identifier.decode('utf-16-be', 'ignore').strip()
+                elif iso.pvd:
+                    self.core.volume_descriptor['volume_id'] = iso.pvd.volume_identifier.decode('ascii', 'ignore').strip()
+                    self.core.volume_descriptor['system_id'] = iso.pvd.system_identifier.decode('ascii', 'ignore').strip()
+
+                self.progress.emit(75, "Building directory tree...")
+                if self._cancelled:
+                    return
+
+                self.core.directory_tree = self.core._build_tree_from_pycdlib()
+
+                self.progress.emit(90, "Extracting boot information...")
+                if self._cancelled:
+                    return
+
+                self.core._extract_boot_info()
+                self.core.iso_modified = False
+
+                self.progress.emit(100, "Complete")
+
+            if not self._cancelled:
+                self.finished.emit()
+
+        except FileNotFoundError:
+            self.core.init_new_iso()
+            logger.error(f"ISO file not found at path: {self.file_path}")
+            self.error.emit(f"ISO file not found:\n{self.file_path}\n\nPossible solutions:\n• Check if the file exists\n• Verify you have read permissions\n• Check if the path is correct")
+        except PermissionError:
+            self.core.init_new_iso()
+            logger.error(f"Permission denied accessing ISO: {self.file_path}")
+            self.error.emit(f"Permission denied:\n{self.file_path}\n\nPossible solutions:\n• Check file permissions\n• Try running with appropriate privileges\n• Check if the file is locked by another application")
+        except Exception as e:
+            self.core.init_new_iso()
+            logger.exception(f"An unexpected error occurred while loading the ISO: {e}")
+            self.error.emit(f"Failed to load ISO:\n{str(e)}\n\nPossible solutions:\n• Verify the file is a valid ISO or CUE file\n• Check if the file is corrupted\n• Try opening with another ISO tool to verify\n• Check available disk space")
+
+
 class RipDiscWorker(QThread):
     """
     A QThread worker for ripping a disc in the background using dd.
@@ -1039,13 +1175,13 @@ class RipDiscWorker(QThread):
     progress = Signal(int) # Percentage
     finished = Signal(str) # Error message (if any)
 
-    def __init__(self, source_drive, dest_path):
+    def __init__(self, source_drive: str, dest_path: str) -> None:
         super().__init__()
-        self.source_drive = source_drive
-        self.dest_path = dest_path
-        self._is_running = True
+        self.source_drive: str = source_drive
+        self.dest_path: str = dest_path
+        self._is_running: bool = True
 
-    def run(self):
+    def run(self) -> None:
         """
         Executes the dd command to rip the disc.
         """
@@ -1830,22 +1966,13 @@ class RipDiscWorker(QThread):
         """Opens a file from the recent files list."""
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "File Not Found",
-                              f"The file no longer exists:\n{file_path}")
+                              f"The file no longer exists:\n{file_path}\n\nPossible solutions:\n• Check if the file was moved or deleted\n• Verify the file path\n• Remove from recent files list")
             self.recent_files.remove(file_path)
             self.save_recent_files()
             self.update_recent_files_menu()
             return
 
-        try:
-            self.core.load_iso(file_path)
-            self.refresh_view()
-            self.add_to_recent_files(file_path)
-            self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
-            logger.info(f"Successfully loaded recent ISO: {file_path}")
-        except Exception as e:
-            logger.exception(f"Failed to load recent ISO: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
-            self.update_status("Error loading ISO")
+        self._load_iso_with_progress(file_path)
 
     def clear_recent_files(self):
         """Clears the recent files list."""
@@ -2104,20 +2231,13 @@ def main():
         app.setApplicationVersion(VERSION)
 
         editor = ISOEditor()
+        editor.show()
 
-        # Open file if specified on command line
+        # Open file if specified on command line (after showing window)
         if args.file:
             logger.info(f"Opening file from command line: {args.file}")
-            try:
-                editor.core.load_iso(args.file)
-                editor.refresh_view()
-                editor.add_to_recent_files(args.file)
-                editor.update_status(f"Loaded ISO: {os.path.basename(args.file)}")
-            except Exception as e:
-                logger.exception(f"Failed to load file from command line: {e}")
-                QMessageBox.critical(editor, "Error", f"Failed to load file: {str(e)}")
+            editor._load_iso_with_progress(args.file)
 
-        editor.show()
         logger.info("Application window shown, entering main event loop...")
         sys.exit(app.exec())
 
