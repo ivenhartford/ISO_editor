@@ -582,11 +582,32 @@ class ISOEditor(QMainWindow):
 
         # View Menu
         view_menu = menu_bar.addMenu("&View")
+
+        find_action = QAction("&Find...", self)
+        find_action.setShortcut("Ctrl+F")
+        find_action.setStatusTip("Focus the search box to filter files")
+        find_action.triggered.connect(self.focus_search)
+        view_menu.addAction(find_action)
+
+        view_menu.addSeparator()
+
         refresh_action = QAction("&Refresh", self)
         refresh_action.setShortcut("F5")
         refresh_action.setStatusTip("Refresh the file tree view")
         refresh_action.triggered.connect(self.refresh_view)
         view_menu.addAction(refresh_action)
+
+        view_menu.addSeparator()
+
+        statistics_action = QAction("ISO &Statistics...", self)
+        statistics_action.setStatusTip("Show ISO statistics and file breakdown")
+        statistics_action.triggered.connect(self.show_statistics)
+        view_menu.addAction(statistics_action)
+
+        export_list_action = QAction("&Export File List...", self)
+        export_list_action.setStatusTip("Export ISO file list to CSV or TXT")
+        export_list_action.triggered.connect(self.export_file_list)
+        view_menu.addAction(export_list_action)
 
         # Help Menu
         help_menu = menu_bar.addMenu("&Help")
@@ -622,6 +643,29 @@ class ISOEditor(QMainWindow):
         right_pane = QGroupBox("ISO Contents")
         right_layout = QVBoxLayout(right_pane)
 
+        # Search bar
+        search_layout = QHBoxLayout()
+        search_label = QLabel("Search:")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter files and folders...")
+        self.search_input.textChanged.connect(self.filter_tree)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setToolTip("Filter tree by name (Ctrl+F to focus)")
+
+        self.case_sensitive_checkbox = QCheckBox("Case sensitive")
+        self.case_sensitive_checkbox.stateChanged.connect(self.filter_tree)
+        self.case_sensitive_checkbox.setToolTip("Enable case-sensitive search")
+
+        self.regex_checkbox = QCheckBox("Regex")
+        self.regex_checkbox.stateChanged.connect(self.filter_tree)
+        self.regex_checkbox.setToolTip("Enable regular expression search")
+
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.case_sensitive_checkbox)
+        search_layout.addWidget(self.regex_checkbox)
+        right_layout.addLayout(search_layout)
+
         self.tree = DroppableTreeWidget()
         self.tree.setHeaderLabels(['Name', 'Size', 'Date Modified', 'Type'])
         self.tree.setToolTip("Drag and drop files or folders here to add them to the ISO.\nRight-click for more options.")
@@ -655,6 +699,80 @@ class ISOEditor(QMainWindow):
         """
         modified_indicator = STATUS_MODIFIED_SUFFIX if self.core.iso_modified else ""
         self.status_bar.showMessage(f"{message}{modified_indicator}")
+
+    def focus_search(self):
+        """Focuses the search input box."""
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def filter_tree(self):
+        """Filters the tree view based on search text."""
+        search_text = self.search_input.text()
+
+        if not search_text:
+            # Show all items if search is empty
+            self._set_all_items_visible(True)
+            return
+
+        case_sensitive = self.case_sensitive_checkbox.isChecked()
+        use_regex = self.regex_checkbox.isChecked()
+
+        # Prepare search pattern
+        if use_regex:
+            try:
+                import re
+                flags = 0 if case_sensitive else re.IGNORECASE
+                pattern = re.compile(search_text, flags)
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern: {e}")
+                self.update_status(f"Invalid regex: {e}")
+                return
+        else:
+            pattern = search_text if case_sensitive else search_text.lower()
+
+        # Filter items
+        self._filter_tree_items(self.tree.invisibleRootItem(), pattern, use_regex, case_sensitive)
+
+    def _set_all_items_visible(self, visible):
+        """Sets visibility for all tree items."""
+        def set_visible_recursive(item):
+            item.setHidden(not visible)
+            for i in range(item.childCount()):
+                set_visible_recursive(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            set_visible_recursive(root.child(i))
+
+    def _filter_tree_items(self, parent_item, pattern, use_regex, case_sensitive):
+        """
+        Recursively filters tree items based on pattern.
+        Returns True if this item or any child matches.
+        """
+        any_child_visible = False
+
+        for i in range(parent_item.childCount()):
+            child = parent_item.child(i)
+            child_name = child.text(0).replace(" [NEW]", "")  # Remove [NEW] tag for matching
+
+            # Check if this item matches
+            if use_regex:
+                matches = bool(pattern.search(child_name))
+            else:
+                search_name = child_name if case_sensitive else child_name.lower()
+                matches = pattern in search_name
+
+            # Recursively check children
+            child_has_visible_children = self._filter_tree_items(child, pattern, use_regex, case_sensitive)
+
+            # Show item if it matches or has visible children
+            should_show = matches or child_has_visible_children
+            child.setHidden(not should_show)
+
+            if should_show:
+                any_child_visible = True
+
+        return any_child_visible
 
     def open_iso(self):
         """Opens an ISO file and loads it into the editor."""
@@ -1238,22 +1356,200 @@ class RipDiscWorker(QThread):
         """
         item = self.tree.itemAt(position)
         if not item:
+            # Show context menu for empty area
+            context_menu = QMenu(self)
+            new_folder_action = context_menu.addAction("New Folder...")
+            context_menu.addSeparator()
+            add_file_action = context_menu.addAction("Add File...")
+            add_folder_action = context_menu.addAction("Add Folder...")
+            import_dir_action = context_menu.addAction("Import Directory...")
+
+            action = context_menu.exec(self.tree.mapToGlobal(position))
+
+            if action == new_folder_action:
+                self.add_folder()
+            elif action == add_file_action:
+                self.add_file()
+            elif action == add_folder_action:
+                self.add_folder()
+            elif action == import_dir_action:
+                self.import_directory()
             return
 
         node = self.tree_item_map.get(id(item))
         if not node:
             return
 
+        is_directory = node.get('is_directory', False)
+
         context_menu = QMenu(self)
+
+        # Add common actions
+        rename_action = context_menu.addAction("Rename...")
+        properties_action = context_menu.addAction("Properties...")
+        copy_path_action = context_menu.addAction("Copy Path")
+
+        context_menu.addSeparator()
+
+        # Directory-specific actions
+        if is_directory:
+            new_folder_here_action = context_menu.addAction("New Folder Here...")
+            add_file_here_action = context_menu.addAction("Add File Here...")
+            context_menu.addSeparator()
+
         extract_action = context_menu.addAction("Extract...")
+
+        context_menu.addSeparator()
         remove_action = context_menu.addAction("Remove")
 
         action = context_menu.exec(self.tree.mapToGlobal(position))
 
-        if action == extract_action:
+        if action == rename_action:
+            self.rename_node(node, item)
+        elif action == properties_action:
+            self.show_node_properties(node)
+        elif action == copy_path_action:
+            self.copy_node_path(node)
+        elif is_directory and action == new_folder_here_action:
+            self.add_folder_to_node(node)
+        elif is_directory and action == add_file_here_action:
+            self.add_file_to_node(node)
+        elif action == extract_action:
             self.extract_selected()
         elif action == remove_action:
             self.remove_selected()
+
+    def rename_node(self, node, item):
+        """Renames a file or folder in the ISO."""
+        old_name = node['name']
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", f"Enter new name for '{old_name}':",
+            text=old_name
+        )
+
+        if ok and new_name and new_name != old_name:
+            # Validate the new name
+            if '/' in new_name or '\\' in new_name:
+                QMessageBox.warning(self, "Invalid Name", "Name cannot contain slashes.")
+                return
+
+            # Check for duplicates
+            parent = node.get('parent')
+            if parent:
+                for sibling in parent['children']:
+                    if sibling != node and sibling['name'].lower() == new_name.lower():
+                        QMessageBox.warning(self, "Duplicate Name",
+                                          f"An item with the name '{new_name}' already exists.")
+                        return
+
+            # Rename the node
+            node['name'] = new_name
+            self.core.iso_modified = True
+
+            # Update the tree item
+            item.setText(0, new_name + (" [NEW]" if node.get('is_new') else ""))
+            self.update_status(f"Renamed '{old_name}' to '{new_name}'")
+            logger.info(f"Renamed node from '{old_name}' to '{new_name}'")
+
+    def show_node_properties(self, node):
+        """Shows properties dialog for a file or folder."""
+        name = node['name']
+        is_dir = node.get('is_directory', False)
+        node_type = "Directory" if is_dir else "File"
+
+        properties_text = f"<h3>{name}</h3>"
+        properties_text += f"<p><b>Type:</b> {node_type}</p>"
+
+        if not is_dir:
+            size = node.get('size', 0)
+            properties_text += f"<p><b>Size:</b> {self.format_file_size(size)} ({size:,} bytes)</p>"
+
+        date = node.get('date', 'Unknown')
+        properties_text += f"<p><b>Date Modified:</b> {date}</p>"
+
+        path = self.core.get_node_path(node)
+        properties_text += f"<p><b>Path:</b> {path}</p>"
+
+        if node.get('is_new'):
+            properties_text += f"<p><b>Status:</b> <i>New (not yet saved)</i></p>"
+
+        if is_dir:
+            # Count children
+            def count_items(n):
+                total_files = 0
+                total_dirs = 0
+                total_size = 0
+                for child in n.get('children', []):
+                    if child.get('is_directory'):
+                        total_dirs += 1
+                        f, d, s = count_items(child)
+                        total_files += f
+                        total_dirs += d
+                        total_size += s
+                    else:
+                        total_files += 1
+                        total_size += child.get('size', 0)
+                return total_files, total_dirs, total_size
+
+            files, dirs, size = count_items(node)
+            properties_text += f"<p><b>Contains:</b> {files} file(s), {dirs} folder(s)</p>"
+            properties_text += f"<p><b>Total Size:</b> {self.format_file_size(size)} ({size:,} bytes)</p>"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Properties")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(properties_text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec()
+
+    def copy_node_path(self, node):
+        """Copies the ISO path of a node to the clipboard."""
+        path = self.core.get_node_path(node)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(path)
+        self.update_status(f"Copied path to clipboard: {path}")
+        logger.debug(f"Copied path to clipboard: {path}")
+
+    def add_folder_to_node(self, target_node):
+        """Adds a new folder to the specified node."""
+        folder_name, ok = QInputDialog.getText(
+            self, "New Folder", "Enter folder name:"
+        )
+
+        if ok and folder_name:
+            # Validate folder name
+            if '/' in folder_name or '\\' in folder_name:
+                QMessageBox.warning(self, "Invalid Name", "Folder name cannot contain slashes.")
+                return
+
+            # Check for duplicates
+            for child in target_node['children']:
+                if child['name'].lower() == folder_name.lower():
+                    QMessageBox.warning(self, "Duplicate Name",
+                                      f"A folder with the name '{folder_name}' already exists.")
+                    return
+
+            self.core.add_folder_to_directory(folder_name, target_node)
+            self.refresh_view()
+            self.update_status(f"Added folder '{folder_name}'")
+            logger.info(f"Added folder '{folder_name}' to {self.core.get_node_path(target_node)}")
+
+    def add_file_to_node(self, target_node):
+        """Adds a file to the specified node."""
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Files to Add", "")
+        if not file_paths:
+            return
+
+        for file_path in file_paths:
+            try:
+                self.core.add_file_to_directory(file_path, target_node)
+                logger.info(f"Added file {os.path.basename(file_path)} to {self.core.get_node_path(target_node)}")
+            except Exception as e:
+                logger.exception(f"Failed to add file {file_path}: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to add {os.path.basename(file_path)}: {e}")
+
+        self.refresh_view()
+        self.update_status(f"Added {len(file_paths)} file(s)")
 
     def show_iso_properties(self):
         """Shows the ISO properties dialog."""
@@ -1298,6 +1594,145 @@ class RipDiscWorker(QThread):
         <p>© 2024 ISO Editor Team</p>
         """
         QMessageBox.about(self, "About ISO Editor", about_text)
+
+    def show_statistics(self):
+        """Shows ISO statistics dialog."""
+        if not self.core.directory_tree or not self.core.volume_descriptor:
+            QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
+            return
+
+        # Calculate statistics
+        stats = self._calculate_statistics(self.core.directory_tree)
+
+        # Build statistics text
+        stats_text = f"""<h2>ISO Statistics</h2>
+
+<h3>Overview</h3>
+<table>
+<tr><td><b>Total Files:</b></td><td>{stats['total_files']:,}</td></tr>
+<tr><td><b>Total Folders:</b></td><td>{stats['total_folders']:,}</td></tr>
+<tr><td><b>Total Size:</b></td><td>{self.format_file_size(stats['total_size'])} ({stats['total_size']:,} bytes)</td></tr>
+</table>
+
+<h3>File Types</h3>
+<table>
+"""
+        # Show top file types
+        for ext, data in sorted(stats['by_extension'].items(), key=lambda x: x[1]['size'], reverse=True)[:10]:
+            stats_text += f"<tr><td><b>{ext if ext else '(no extension)'}:</b></td><td>{data['count']} file(s), {self.format_file_size(data['size'])}</td></tr>\n"
+
+        stats_text += "</table>\n\n<h3>Largest Files</h3>\n<table>\n"
+
+        # Show top 10 largest files
+        for name, size in stats['largest_files'][:10]:
+            stats_text += f"<tr><td><b>{name}:</b></td><td>{self.format_file_size(size)}</td></tr>\n"
+
+        stats_text += "</table>"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("ISO Statistics")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(stats_text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec()
+
+    def _calculate_statistics(self, node):
+        """Recursively calculates statistics for the ISO."""
+        stats = {
+            'total_files': 0,
+            'total_folders': 0,
+            'total_size': 0,
+            'by_extension': {},  # ext -> {count, size}
+            'largest_files': []  # list of (name, size)
+        }
+
+        def process_node(n):
+            if n.get('is_directory'):
+                stats['total_folders'] += 1
+                for child in n.get('children', []):
+                    process_node(child)
+            else:
+                stats['total_files'] += 1
+                size = n.get('size', 0)
+                stats['total_size'] += size
+
+                # Track by extension
+                name = n.get('name', '')
+                ext = os.path.splitext(name)[1].lower() if '.' in name else ''
+                if ext not in stats['by_extension']:
+                    stats['by_extension'][ext] = {'count': 0, 'size': 0}
+                stats['by_extension'][ext]['count'] += 1
+                stats['by_extension'][ext]['size'] += size
+
+                # Track largest files
+                stats['largest_files'].append((name, size))
+
+        process_node(node)
+
+        # Sort largest files
+        stats['largest_files'].sort(key=lambda x: x[1], reverse=True)
+
+        return stats
+
+    def export_file_list(self):
+        """Exports the file list to CSV or TXT."""
+        if not self.core.directory_tree or not self.core.volume_descriptor:
+            QMessageBox.warning(self, "No ISO", "No ISO file loaded.")
+            return
+
+        # Ask user for format and location
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export File List",
+            "file_list.csv",
+            "CSV Files (*.csv);;Text Files (*.txt)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            is_csv = file_path.endswith('.csv') or 'CSV' in selected_filter
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                if is_csv:
+                    f.write("Path,Name,Type,Size (bytes),Size (formatted),Date Modified\n")
+                else:
+                    f.write("ISO File List\n")
+                    f.write("=" * 80 + "\n\n")
+
+                self._write_file_list(f, self.core.directory_tree, "", is_csv)
+
+            QMessageBox.information(self, "Success",
+                                  f"File list exported successfully to:\n{file_path}")
+            logger.info(f"Exported file list to {file_path}")
+
+        except Exception as e:
+            logger.exception(f"Failed to export file list: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to export file list:\n{str(e)}")
+
+    def _write_file_list(self, file, node, parent_path, is_csv):
+        """Recursively writes the file list."""
+        for child in node.get('children', []):
+            name = child.get('name', '')
+            is_dir = child.get('is_directory', False)
+            size = child.get('size', 0) if not is_dir else 0
+            date = child.get('date', '')
+            node_type = ITEM_TYPE_DIRECTORY if is_dir else ITEM_TYPE_FILE
+            path = parent_path + "/" + name
+
+            if is_csv:
+                # CSV format
+                size_formatted = self.format_file_size(size) if not is_dir else ""
+                file.write(f'"{path}","{name}","{node_type}",{size},"{size_formatted}","{date}"\n')
+            else:
+                # Text format
+                indent = "  " * parent_path.count("/")
+                type_marker = "[D]" if is_dir else "[F]"
+                size_str = self.format_file_size(size) if not is_dir else ""
+                file.write(f"{indent}{type_marker} {name:<40} {size_str:>15} {date}\n")
+
+            if is_dir:
+                self._write_file_list(file, child, path, is_csv)
 
     def closeEvent(self, event):
         """Handle window close event - check for unsaved changes."""
