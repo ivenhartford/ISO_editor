@@ -19,6 +19,10 @@ from PySide6.QtCore import Qt, QPoint, Signal, QThread
 import os
 import traceback
 from iso_logic import ISOCore, TreeNode
+from commands import (
+    CommandHistory, AddFileCommand, RemoveNodeCommand,
+    AddFolderCommand, RenameNodeCommand
+)
 from constants import (
     VERSION, APP_NAME,
     MAX_VOLUME_ID_LENGTH, MAX_SYSTEM_ID_LENGTH,
@@ -482,6 +486,7 @@ class ISOEditor(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setGeometry(100, 100, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         self.core = ISOCore()
+        self.command_history = CommandHistory(max_history=50)
         self.tree_item_map = {}
         self.show_hidden = False
         self.recent_files = self.load_recent_files()
@@ -547,6 +552,24 @@ class ISOEditor(QMainWindow):
 
         # Edit Menu
         edit_menu = menu_bar.addMenu("&Edit")
+
+        # Undo/Redo actions
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.setStatusTip("Undo the last action")
+        self.undo_action.triggered.connect(self.undo)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcut("Ctrl+Shift+Z")
+        self.redo_action.setStatusTip("Redo the last undone action")
+        self.redo_action.triggered.connect(self.redo)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
+
+        edit_menu.addSeparator()
+
         add_file_action = QAction("Add &File...", self)
         add_file_action.setShortcut("Ctrl+F")
         add_file_action.setStatusTip("Add a file to the ISO image")
@@ -685,6 +708,44 @@ class ISOEditor(QMainWindow):
         self.splitter.setSizes([DEFAULT_LEFT_PANE_WIDTH, DEFAULT_RIGHT_PANE_WIDTH])
         main_layout.addWidget(self.splitter)
 
+    def undo(self):
+        """Undo the last command."""
+        description = self.command_history.undo()
+        if description:
+            self.refresh_view()
+            self.update_undo_redo_actions()
+            self.update_status(f"Undone: {description}")
+            logger.info(f"Undone: {description}")
+
+    def redo(self):
+        """Redo the last undone command."""
+        description = self.command_history.redo()
+        if description:
+            self.refresh_view()
+            self.update_undo_redo_actions()
+            self.update_status(f"Redone: {description}")
+            logger.info(f"Redone: {description}")
+
+    def update_undo_redo_actions(self):
+        """Update the enabled state and tooltips of undo/redo actions."""
+        # Update undo action
+        can_undo = self.command_history.can_undo()
+        self.undo_action.setEnabled(can_undo)
+        if can_undo:
+            desc = self.command_history.get_undo_description()
+            self.undo_action.setStatusTip(f"Undo: {desc}")
+        else:
+            self.undo_action.setStatusTip("Undo the last action")
+
+        # Update redo action
+        can_redo = self.command_history.can_redo()
+        self.redo_action.setEnabled(can_redo)
+        if can_redo:
+            desc = self.command_history.get_redo_description()
+            self.redo_action.setStatusTip(f"Redo: {desc}")
+        else:
+            self.redo_action.setStatusTip("Redo the last undone action")
+
     def create_status_bar(self):
         """Creates the status bar."""
         self.status_bar = QStatusBar()
@@ -818,7 +879,9 @@ class ISOEditor(QMainWindow):
     def load_finished(self, file_path):
         """Called when ISO load completes successfully."""
         self.load_progress_dialog.setValue(100)
+        self.command_history.clear()
         self.refresh_view()
+        self.update_undo_redo_actions()
         self.add_to_recent_files(file_path)
         self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
         logger.info(f"Successfully loaded ISO: {file_path}")
@@ -844,7 +907,9 @@ class ISOEditor(QMainWindow):
                 if self.core.iso_modified: # If save was cancelled
                     return
         self.core.init_new_iso()
+        self.command_history.clear()
         self.refresh_view()
+        self.update_undo_redo_actions()
         self.update_status("Created new empty ISO.")
         logger.info("New empty ISO created.")
 
@@ -1271,6 +1336,7 @@ class RipDiscWorker(QThread):
             logger.info("Add Files dialog cancelled.")
             return
 
+        success_count = 0
         for fp in file_paths:
             try:
                 if any(c['name'].lower() == os.path.basename(fp).lower() for c in target_node['children']):
@@ -1278,13 +1344,18 @@ class RipDiscWorker(QThread):
                                                    QMessageBox.Yes | QMessageBox.No)
                     if reply == QMessageBox.No:
                         continue
-                self.core.add_file_to_directory(fp, target_node)
+
+                # Use command for undo/redo support
+                cmd = AddFileCommand(self.core, fp, target_node)
+                if self.command_history.execute(cmd):
+                    success_count += 1
             except Exception as e:
                 logger.exception(f"Failed to add file {fp}: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to add file {os.path.basename(fp)}: {e}")
 
         self.refresh_view()
-        self.update_status(f"Added {len(file_paths)} file(s)")
+        self.update_undo_redo_actions()
+        self.update_status(f"Added {success_count} file(s)")
 
     def add_folder(self):
         """Adds a folder to the ISO."""
@@ -1304,9 +1375,12 @@ class RipDiscWorker(QThread):
                 QMessageBox.warning(self, "Folder Exists", f"A folder with the name '{folder_name}' already exists.")
                 return
 
-            self.core.add_folder_to_directory(folder_name, target_node)
-            self.refresh_view()
-            self.update_status(f"Added folder: {folder_name}")
+            # Use command for undo/redo support
+            cmd = AddFolderCommand(self.core, folder_name, target_node)
+            if self.command_history.execute(cmd):
+                self.refresh_view()
+                self.update_undo_redo_actions()
+                self.update_status(f"Added folder: {folder_name}")
         except Exception as e:
             logger.exception(f"Failed to add folder: {e}")
             QMessageBox.critical(self, "Error", f"An unexpected error occurred while adding the folder: {e}")
@@ -1326,9 +1400,12 @@ class RipDiscWorker(QThread):
 
             if reply == QMessageBox.Yes:
                 logger.info(f"User confirmed removal of node: {node_name}")
-                self.core.remove_node(node)
-                self.refresh_view()
-                self.update_status(f"Removed '{node_name}'")
+                # Use command for undo/redo support
+                cmd = RemoveNodeCommand(self.core, node)
+                if self.command_history.execute(cmd):
+                    self.refresh_view()
+                    self.update_undo_redo_actions()
+                    self.update_status(f"Removed '{node_name}'")
             else:
                 logger.info(f"User cancelled removal of node: {node_name}")
         except Exception as e:
@@ -1578,14 +1655,16 @@ class RipDiscWorker(QThread):
                                           f"An item with the name '{new_name}' already exists.")
                         return
 
-            # Rename the node
-            node['name'] = new_name
-            self.core.iso_modified = True
+            # Use command for undo/redo support
+            cmd = RenameNodeCommand(node, old_name, new_name)
+            if self.command_history.execute(cmd):
+                self.core.iso_modified = True
 
-            # Update the tree item
-            item.setText(0, new_name + (" [NEW]" if node.get('is_new') else ""))
-            self.update_status(f"Renamed '{old_name}' to '{new_name}'")
-            logger.info(f"Renamed node from '{old_name}' to '{new_name}'")
+                # Update the tree item
+                item.setText(0, new_name + (" [NEW]" if node.get('is_new') else ""))
+                self.update_status(f"Renamed '{old_name}' to '{new_name}'")
+                self.update_undo_redo_actions()
+                logger.info(f"Renamed node from '{old_name}' to '{new_name}'")
 
     def show_node_properties(self, node):
         """Shows properties dialog for a file or folder."""
