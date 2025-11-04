@@ -4,6 +4,7 @@ import logging
 import glob
 import subprocess
 import re
+import json
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QLabel, QStatusBar, QMenu,
@@ -36,6 +37,8 @@ class DroppableTreeWidget(QTreeWidget):
         """
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self._drag_active = False
+        self._original_style = None
 
     def dragEnterEvent(self, event):
         """
@@ -46,8 +49,24 @@ class DroppableTreeWidget(QTreeWidget):
         """
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self._drag_active = True
+            if not self._original_style:
+                self._original_style = self.styleSheet()
+            self.setStyleSheet(self._original_style + "\nQTreeWidget { border: 2px solid #4A90E2; background-color: #E8F4FF; }")
         else:
             super().dragEnterEvent(event)
+
+    def dragLeaveEvent(self, event):
+        """
+        Handles the drag leave event. Restores original styling.
+
+        Args:
+            event (QDragLeaveEvent): The drag leave event.
+        """
+        self._drag_active = False
+        if self._original_style is not None:
+            self.setStyleSheet(self._original_style)
+        super().dragLeaveEvent(event)
 
     def dragMoveEvent(self, event):
         """
@@ -68,6 +87,10 @@ class DroppableTreeWidget(QTreeWidget):
         Args:
             event (QDropEvent): The drop event.
         """
+        self._drag_active = False
+        if self._original_style is not None:
+            self.setStyleSheet(self._original_style)
+
         if event.mimeData().hasUrls():
             urls = [url.toLocalFile() for url in event.mimeData().urls()]
             if urls:
@@ -87,7 +110,9 @@ class SaveAsDialog(QDialog):
 
         form_layout = QFormLayout()
         self.file_path_edit = QLineEdit()
+        self.file_path_edit.setPlaceholderText("Choose output file path...")
         browse_button = QPushButton("Browse...")
+        browse_button.setToolTip("Browse for output file location")
         browse_button.clicked.connect(self.browse)
 
         path_layout = QHBoxLayout()
@@ -98,14 +123,17 @@ class SaveAsDialog(QDialog):
 
         self.udf_checkbox = QCheckBox("Enable UDF Support")
         self.udf_checkbox.setChecked(True)
+        self.udf_checkbox.setToolTip("Universal Disk Format - recommended for better compatibility with modern systems")
         form_layout.addRow(self.udf_checkbox)
 
         self.hybrid_checkbox = QCheckBox("Create Hybrid ISO")
         self.hybrid_checkbox.setChecked(False)
+        self.hybrid_checkbox.setToolTip("Create a hybrid ISO that can boot from both CD/DVD and USB drives")
         form_layout.addRow(self.hybrid_checkbox)
 
         self.checksum_checkbox = QCheckBox("Verify checksums after saving")
         self.checksum_checkbox.setChecked(True)
+        self.checksum_checkbox.setToolTip("Calculate MD5, SHA-1, and SHA-256 checksums after saving for verification")
         form_layout.addRow(self.checksum_checkbox)
 
         self.layout.addLayout(form_layout)
@@ -178,7 +206,11 @@ class PropertiesDialog(QDialog):
         volume_group = QGroupBox("Volume Properties")
         volume_layout = QFormLayout()
         self.volume_id_edit = QLineEdit(core.volume_descriptor.get('volume_id', ''))
+        self.volume_id_edit.setToolTip("ISO volume label (max 32 characters)")
+        self.volume_id_edit.setMaxLength(32)
         self.system_id_edit = QLineEdit(core.volume_descriptor.get('system_id', ''))
+        self.system_id_edit.setToolTip("System identifier (max 32 characters)")
+        self.system_id_edit.setMaxLength(32)
         volume_layout.addRow("Volume ID:", self.volume_id_edit)
         volume_layout.addRow("System ID:", self.system_id_edit)
         volume_group.setLayout(volume_layout)
@@ -205,7 +237,10 @@ class PropertiesDialog(QDialog):
 
         # BIOS Boot Image
         self.boot_image_edit = QLineEdit(core.boot_image_path or '')
+        self.boot_image_edit.setPlaceholderText("Path to BIOS boot image (.img, .bin)...")
+        self.boot_image_edit.setToolTip("El Torito boot image for BIOS systems (typically boot.img)")
         bios_browse_button = QPushButton("Browse...")
+        bios_browse_button.setToolTip("Browse for BIOS boot image file")
         bios_browse_button.clicked.connect(lambda: self.browse_for_image(self.boot_image_edit, "Select BIOS Boot Image"))
         bios_boot_layout = QHBoxLayout()
         bios_boot_layout.addWidget(self.boot_image_edit)
@@ -215,13 +250,17 @@ class PropertiesDialog(QDialog):
         # Emulation Type
         self.emulation_combo = QComboBox()
         self.emulation_combo.addItems(['noemul', 'floppy', 'hdemul'])
+        self.emulation_combo.setToolTip("Boot emulation mode:\n• noemul: No emulation (recommended)\n• floppy: Floppy disk emulation\n• hdemul: Hard disk emulation")
         current_emulation = core.boot_emulation_type or 'noemul'
         self.emulation_combo.setCurrentText(current_emulation)
         boot_form_layout.addRow("Emulation Type:", self.emulation_combo)
 
         # EFI Boot Image
         self.efi_boot_image_edit = QLineEdit(core.efi_boot_image_path or '')
+        self.efi_boot_image_edit.setPlaceholderText("Path to EFI boot image...")
+        self.efi_boot_image_edit.setToolTip("EFI boot image for UEFI systems (typically efiboot.img)")
         efi_browse_button = QPushButton("Browse...")
+        efi_browse_button.setToolTip("Browse for EFI boot image file")
         efi_browse_button.clicked.connect(lambda: self.browse_for_image(self.efi_boot_image_edit, "Select EFI Boot Image"))
         efi_boot_layout = QHBoxLayout()
         efi_boot_layout.addWidget(self.efi_boot_image_edit)
@@ -417,6 +456,8 @@ class ISOEditor(QMainWindow):
         self.core = ISOCore()
         self.tree_item_map = {}
         self.show_hidden = False
+        self.recent_files = self.load_recent_files()
+        self.max_recent_files = 10
 
         self.create_menu()
         self.create_main_interface()
@@ -431,65 +472,100 @@ class ISOEditor(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
 
         new_action = QAction("&New ISO...", self)
+        new_action.setShortcut("Ctrl+N")
+        new_action.setStatusTip("Create a new empty ISO image")
         new_action.triggered.connect(self.new_iso)
         file_menu.addAction(new_action)
 
         open_action = QAction("&Open ISO...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.setStatusTip("Open an existing ISO or CUE file")
         open_action.triggered.connect(self.open_iso)
         file_menu.addAction(open_action)
 
+        # Recent Files submenu
+        self.recent_menu = file_menu.addMenu("Recent &Files")
+        self.update_recent_files_menu()
+
         if IS_LINUX:
             rip_disc_action = QAction("Create ISO from &Disc...", self)
+            rip_disc_action.setShortcut("Ctrl+D")
+            rip_disc_action.setStatusTip("Create an ISO image from an optical disc")
             rip_disc_action.triggered.connect(self.rip_disc)
             file_menu.addAction(rip_disc_action)
 
         file_menu.addSeparator()
 
         save_action = QAction("&Save ISO", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.setStatusTip("Save the current ISO image")
         save_action.triggered.connect(self.save_iso)
         file_menu.addAction(save_action)
 
         save_as_action = QAction("Save ISO &As...", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.setStatusTip("Save the ISO image with a new name or options")
         save_as_action.triggered.connect(self.save_iso_as)
         file_menu.addAction(save_as_action)
 
         file_menu.addSeparator()
 
         exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.setStatusTip("Exit the application")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
         # Edit Menu
         edit_menu = menu_bar.addMenu("&Edit")
         add_file_action = QAction("Add &File...", self)
+        add_file_action.setShortcut("Ctrl+F")
+        add_file_action.setStatusTip("Add a file to the ISO image")
         add_file_action.triggered.connect(self.add_file)
         edit_menu.addAction(add_file_action)
 
         add_folder_action = QAction("Add F&older...", self)
+        add_folder_action.setShortcut("Ctrl+Shift+F")
+        add_folder_action.setStatusTip("Create a new folder in the ISO image")
         add_folder_action.triggered.connect(self.add_folder)
         edit_menu.addAction(add_folder_action)
 
         import_dir_action = QAction("&Import Directory...", self)
+        import_dir_action.setShortcut("Ctrl+I")
+        import_dir_action.setStatusTip("Import an entire directory tree into the ISO")
         import_dir_action.triggered.connect(self.import_directory)
         edit_menu.addAction(import_dir_action)
 
         edit_menu.addSeparator()
 
         remove_action = QAction("&Remove Selected", self)
+        remove_action.setShortcut("Delete")
+        remove_action.setStatusTip("Remove the selected file or folder")
         remove_action.triggered.connect(self.remove_selected)
         edit_menu.addAction(remove_action)
 
         edit_menu.addSeparator()
 
         properties_action = QAction("ISO &Properties...", self)
+        properties_action.setShortcut("Alt+Return")
+        properties_action.setStatusTip("Edit ISO properties such as volume ID and boot options")
         properties_action.triggered.connect(self.show_iso_properties)
         edit_menu.addAction(properties_action)
 
         # View Menu
         view_menu = menu_bar.addMenu("&View")
         refresh_action = QAction("&Refresh", self)
+        refresh_action.setShortcut("F5")
+        refresh_action.setStatusTip("Refresh the file tree view")
         refresh_action.triggered.connect(self.refresh_view)
         view_menu.addAction(refresh_action)
+
+        # Help Menu
+        help_menu = menu_bar.addMenu("&Help")
+        about_action = QAction("&About ISO Editor...", self)
+        about_action.setStatusTip("About this application")
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
 
     def create_main_interface(self):
         """Creates the main user interface of the application."""
@@ -520,6 +596,7 @@ class ISOEditor(QMainWindow):
 
         self.tree = DroppableTreeWidget()
         self.tree.setHeaderLabels(['Name', 'Size', 'Date Modified', 'Type'])
+        self.tree.setToolTip("Drag and drop files or folders here to add them to the ISO.\nRight-click for more options.")
         self.tree.filesDropped.connect(self.handle_drop)
         self.tree.setColumnWidth(0, 300)
         self.tree.setColumnWidth(1, 100)
@@ -527,6 +604,7 @@ class ISOEditor(QMainWindow):
         self.tree.setColumnWidth(3, 100)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        self.tree.setSelectionMode(self.tree.ExtendedSelection)  # Allow multi-selection
         right_layout.addWidget(self.tree)
 
         splitter.addWidget(right_pane)
@@ -560,6 +638,7 @@ class ISOEditor(QMainWindow):
         try:
             self.core.load_iso(file_path)
             self.refresh_view()
+            self.add_to_recent_files(file_path)
             self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
             logger.info(f"Successfully loaded ISO: {file_path}")
         except Exception as e:
@@ -1173,6 +1252,139 @@ class RipDiscWorker(QThread):
                 self.core.boot_emulation_type = new_props['boot_emulation_type']
                 self.core.iso_modified = True
                 self.refresh_view()
+
+    def show_about(self):
+        """Shows the About dialog."""
+        about_text = """<h2>ISO Editor</h2>
+        <p><b>Version:</b> 1.0.0</p>
+        <p>A comprehensive ISO image editor with support for:</p>
+        <ul>
+        <li>ISO 9660, Joliet, Rock Ridge, and UDF formats</li>
+        <li>El Torito bootable images (BIOS and EFI)</li>
+        <li>Hybrid ISOs for USB booting</li>
+        <li>CUE/BIN disc image format</li>
+        <li>Disc ripping (Linux)</li>
+        </ul>
+        <p><b>Built with:</b> Python, PySide6, pycdlib</p>
+        <p>© 2024 ISO Editor Team</p>
+        """
+        QMessageBox.about(self, "About ISO Editor", about_text)
+
+    def closeEvent(self, event):
+        """Handle window close event - check for unsaved changes."""
+        if self.core.iso_modified:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Do you want to save before exiting?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+
+            if reply == QMessageBox.Save:
+                self.save_iso()
+                # Check if save was successful (user might have cancelled)
+                if self.core.iso_modified:
+                    event.ignore()
+                    return
+            elif reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+
+        # Clean up resources
+        self.core.close_iso()
+        event.accept()
+
+    def get_recent_files_path(self):
+        """Returns the path to the recent files JSON file."""
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(home, ".config", "iso-editor")
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, "recent_files.json")
+
+    def load_recent_files(self):
+        """Loads the list of recent files from disk."""
+        try:
+            recent_path = self.get_recent_files_path()
+            if os.path.exists(recent_path):
+                with open(recent_path, 'r') as f:
+                    files = json.load(f)
+                    # Filter out files that no longer exist
+                    return [f for f in files if os.path.exists(f)]
+            return []
+        except Exception as e:
+            logger.error(f"Failed to load recent files: {e}")
+            return []
+
+    def save_recent_files(self):
+        """Saves the list of recent files to disk."""
+        try:
+            recent_path = self.get_recent_files_path()
+            with open(recent_path, 'w') as f:
+                json.dump(self.recent_files, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save recent files: {e}")
+
+    def add_to_recent_files(self, file_path):
+        """Adds a file to the recent files list."""
+        # Remove if already in list
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        # Add to front
+        self.recent_files.insert(0, file_path)
+        # Limit to max_recent_files
+        self.recent_files = self.recent_files[:self.max_recent_files]
+        self.save_recent_files()
+        self.update_recent_files_menu()
+
+    def update_recent_files_menu(self):
+        """Updates the Recent Files menu with current items."""
+        self.recent_menu.clear()
+
+        if not self.recent_files:
+            no_recent_action = QAction("No recent files", self)
+            no_recent_action.setEnabled(False)
+            self.recent_menu.addAction(no_recent_action)
+        else:
+            for i, file_path in enumerate(self.recent_files):
+                # Show just the filename, but store full path
+                display_name = f"{i+1}. {os.path.basename(file_path)}"
+                action = QAction(display_name, self)
+                action.setStatusTip(file_path)
+                action.setData(file_path)
+                action.triggered.connect(lambda checked=False, fp=file_path: self.open_recent_file(fp))
+                self.recent_menu.addAction(action)
+
+            self.recent_menu.addSeparator()
+            clear_action = QAction("Clear Recent Files", self)
+            clear_action.triggered.connect(self.clear_recent_files)
+            self.recent_menu.addAction(clear_action)
+
+    def open_recent_file(self, file_path):
+        """Opens a file from the recent files list."""
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "File Not Found",
+                              f"The file no longer exists:\n{file_path}")
+            self.recent_files.remove(file_path)
+            self.save_recent_files()
+            self.update_recent_files_menu()
+            return
+
+        try:
+            self.core.load_iso(file_path)
+            self.refresh_view()
+            self.add_to_recent_files(file_path)
+            self.update_status(f"Loaded ISO: {os.path.basename(file_path)}")
+            logger.info(f"Successfully loaded recent ISO: {file_path}")
+        except Exception as e:
+            logger.exception(f"Failed to load recent ISO: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load ISO: {str(e)}")
+            self.update_status("Error loading ISO")
+
+    def clear_recent_files(self):
+        """Clears the recent files list."""
+        self.recent_files = []
+        self.save_recent_files()
+        self.update_recent_files_menu()
 
     def refresh_view(self):
         """Refreshes the tree view to show the current state of the ISO."""
