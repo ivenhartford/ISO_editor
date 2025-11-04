@@ -120,9 +120,40 @@ class SaveAsDialog(QDialog):
         if file_path:
             self.file_path_edit.setText(file_path)
 
+    def accept(self):
+        """Validate input before accepting the dialog."""
+        file_path = self.file_path_edit.text().strip()
+
+        if not file_path:
+            QMessageBox.warning(self, "Invalid Input", "Please specify a file path.")
+            return
+
+        # Validate the directory exists
+        directory = os.path.dirname(file_path)
+        if directory and not os.path.exists(directory):
+            QMessageBox.warning(self, "Invalid Path", f"Directory does not exist:\n{directory}")
+            return
+
+        # Check if directory is writable
+        if directory:
+            test_dir = directory
+        else:
+            test_dir = os.getcwd()
+
+        if not os.access(test_dir, os.W_OK):
+            QMessageBox.warning(self, "Permission Denied", f"Cannot write to directory:\n{test_dir}")
+            return
+
+        # Ensure .iso extension
+        if not file_path.lower().endswith('.iso'):
+            file_path += '.iso'
+            self.file_path_edit.setText(file_path)
+
+        super().accept()
+
     def get_options(self):
         return {
-            'file_path': self.file_path_edit.text(),
+            'file_path': self.file_path_edit.text().strip(),
             'use_udf': self.udf_checkbox.isChecked(),
             'make_hybrid': self.hybrid_checkbox.isChecked(),
             'calculate_checksums': self.checksum_checkbox.isChecked()
@@ -211,12 +242,54 @@ class PropertiesDialog(QDialog):
         if file_path:
             line_edit.setText(file_path)
 
+    def accept(self):
+        """Validate input before accepting the dialog."""
+        volume_id = self.volume_id_edit.text().strip()
+        system_id = self.system_id_edit.text().strip()
+
+        # Validate volume ID
+        if not volume_id:
+            QMessageBox.warning(self, "Invalid Input", "Volume ID cannot be empty.")
+            return
+
+        if len(volume_id) > 32:
+            QMessageBox.warning(self, "Invalid Input", "Volume ID must be 32 characters or less.")
+            return
+
+        # Validate system ID
+        if len(system_id) > 32:
+            QMessageBox.warning(self, "Invalid Input", "System ID must be 32 characters or less.")
+            return
+
+        # Validate boot image paths if provided
+        boot_path = self.boot_image_edit.text().strip()
+        if boot_path and not os.path.exists(boot_path):
+            reply = QMessageBox.question(
+                self, "File Not Found",
+                f"BIOS boot image file not found:\n{boot_path}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        efi_path = self.efi_boot_image_edit.text().strip()
+        if efi_path and not os.path.exists(efi_path):
+            reply = QMessageBox.question(
+                self, "File Not Found",
+                f"EFI boot image file not found:\n{efi_path}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        super().accept()
+
     def get_properties(self):
         return {
-            'volume_id': self.volume_id_edit.text(),
-            'system_id': self.system_id_edit.text(),
-            'boot_image_path': self.boot_image_edit.text(),
-            'efi_boot_image_path': self.efi_boot_image_edit.text(),
+            'volume_id': self.volume_id_edit.text().strip(),
+            'system_id': self.system_id_edit.text().strip(),
+            'boot_image_path': self.boot_image_edit.text().strip(),
+            'efi_boot_image_path': self.efi_boot_image_edit.text().strip(),
             'boot_emulation_type': self.emulation_combo.currentText()
         }
 
@@ -271,6 +344,55 @@ class RipDiscDialog(QDialog):
         if file_path:
             self.output_path_edit.setText(file_path)
 
+    def accept(self):
+        """Validate input before accepting the dialog."""
+        if not self.drive_combo.isEnabled():
+            QMessageBox.warning(self, "No Drives", "No optical drives were found.")
+            return
+
+        drive = self.drive_combo.currentText()
+        if not drive or "No drives found" in drive:
+            QMessageBox.warning(self, "No Drive Selected", "Please select a valid optical drive.")
+            return
+
+        output_path = self.output_path_edit.text().strip()
+        if not output_path:
+            QMessageBox.warning(self, "Invalid Input", "Please specify an output file path.")
+            return
+
+        # Validate the directory exists
+        directory = os.path.dirname(output_path)
+        if directory and not os.path.exists(directory):
+            QMessageBox.warning(self, "Invalid Path", f"Directory does not exist:\n{directory}")
+            return
+
+        # Check if directory is writable
+        if directory:
+            test_dir = directory
+        else:
+            test_dir = os.getcwd()
+
+        if not os.access(test_dir, os.W_OK):
+            QMessageBox.warning(self, "Permission Denied", f"Cannot write to directory:\n{test_dir}")
+            return
+
+        # Ensure .iso extension
+        if not output_path.lower().endswith('.iso'):
+            output_path += '.iso'
+            self.output_path_edit.setText(output_path)
+
+        # Check if drive is accessible
+        if not os.path.exists(drive):
+            reply = QMessageBox.question(
+                self, "Drive Not Accessible",
+                f"Cannot access drive:\n{drive}\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        super().accept()
+
     def get_rip_options(self):
         """
         Gets the selected options from the dialog.
@@ -279,7 +401,7 @@ class RipDiscDialog(QDialog):
             return None
         return {
             'drive': self.drive_combo.currentText(),
-            'output_path': self.output_path_edit.text()
+            'output_path': self.output_path_edit.text().strip()
         }
 
 
@@ -533,8 +655,8 @@ class ISOEditor(QMainWindow):
 
     def cancel_save(self):
         if self.save_thread.isRunning():
-            self.save_thread.terminate()
-            self.update_status("Save cancelled.")
+            self.save_thread.cancel()
+            self.update_status("Cancelling save operation...")
 
     def save_finished(self, file_path):
         self.progress_dialog.setValue(100)
@@ -619,17 +741,29 @@ class SaveWorker(QThread):
         self.file_path = file_path
         self.use_udf = use_udf
         self.make_hybrid = make_hybrid
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation of the save operation."""
+        self._cancelled = True
 
     def run(self):
         try:
             # The progress callback for pycdlib's write method
             def progress_cb(done, total, opaque):
+                if self._cancelled:
+                    raise InterruptedError("Save operation cancelled by user")
                 percent = (done * 100) // total
                 self.progress.emit(percent)
 
             self.core.save_iso(self.file_path, use_joliet=True, use_rock_ridge=True, progress_callback=progress_cb, use_udf=self.use_udf, make_hybrid=self.make_hybrid)
-            self.finished.emit(self.file_path)
+            if not self._cancelled:
+                self.finished.emit(self.file_path)
+        except InterruptedError as e:
+            logger.info(f"Save operation cancelled: {e}")
+            self.error.emit("Save cancelled by user")
         except Exception as e:
+            logger.exception(f"Error during save operation: {e}")
             self.error.emit(str(e))
 
 
@@ -644,6 +778,11 @@ class ChecksumWorker(QThread):
     def __init__(self, file_path):
         super().__init__()
         self.file_path = file_path
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation of the checksum calculation."""
+        self._cancelled = True
 
     def run(self):
         """
@@ -653,11 +792,16 @@ class ChecksumWorker(QThread):
             hashes = {'md5': hashlib.md5(), 'sha1': hashlib.sha1(), 'sha256': hashlib.sha256()}
             with open(self.file_path, 'rb') as f:
                 while chunk := f.read(8192):
+                    if self._cancelled:
+                        logger.info("Checksum calculation cancelled by user")
+                        self.finished.emit({}, "Checksum calculation cancelled")
+                        return
                     for h in hashes.values():
                         h.update(chunk)
 
-            results = {name: h.hexdigest() for name, h in hashes.items()}
-            self.finished.emit(results, "")
+            if not self._cancelled:
+                results = {name: h.hexdigest() for name, h in hashes.items()}
+                self.finished.emit(results, "")
         except Exception as e:
             logger.error(f"Checksum calculation failed for {self.file_path}: {e}")
             self.finished.emit({}, f"Failed to calculate checksums: {e}")
@@ -704,7 +848,23 @@ class RipDiscWorker(QThread):
                         self.progress.emit(min(percent, 100))
 
             if not self._is_running:
+                logger.info("Rip disc operation cancelled, terminating dd process")
                 process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("dd process did not terminate gracefully, killing it")
+                    process.kill()
+                    process.wait()
+
+                # Clean up partial output file
+                if os.path.exists(self.dest_path):
+                    try:
+                        os.remove(self.dest_path)
+                        logger.info(f"Removed partial output file: {self.dest_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to remove partial output file: {e}")
+
                 self.finished.emit("Ripping cancelled by user.")
                 return
 

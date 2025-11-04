@@ -549,7 +549,8 @@ class ISOCore:
                                 if record.inode == boot_inode_num:
                                     boot_image_path = posixpath.join(root, f)
                                     break
-                            except:
+                            except (pycdlib.pycdlibexception.PyCdlibException, AttributeError, KeyError) as e:
+                                logger.debug(f"Could not retrieve record for {posixpath.join(root, f)}: {e}")
                                 continue
                         if boot_image_path != "Unknown":
                             break
