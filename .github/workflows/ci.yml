@@ -37,7 +37,33 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 x11-utils libgl1-mesa-glx libegl1-mesa libxcb-cursor0
+        sudo apt-get install -y \
+          libxkbcommon-x11-0 \
+          libxcb-icccm4 \
+          libxcb-image0 \
+          libxcb-keysyms1 \
+          libxcb-randr0 \
+          libxcb-render-util0 \
+          libxcb-xinerama0 \
+          libxcb-xfixes0 \
+          libxcb-cursor0 \
+          libxcb-shape0 \
+          x11-utils \
+          libgl1 \
+          libegl1 \
+          libdbus-1-3 \
+          libxkbcommon0 \
+          libfontconfig1 \
+          libfreetype6 \
+          libx11-6 \
+          libx11-xcb1 \
+          xvfb
+
+    - name: Start virtual display (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+        echo "DISPLAY=:99" >> $GITHUB_ENV
 
     - name: Run syntax check
       run: |
